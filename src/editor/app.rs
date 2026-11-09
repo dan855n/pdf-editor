@@ -1353,17 +1353,18 @@ impl EditorApp {
         }
 
         let (x, y) = self.screen_to_pdf(page, page_rect, pos);
+        let hit = doc.annotations[page]
+            .iter()
+            .rev()
+            .find(|annotation| annotation.contains_point(x, y, 5.0 / self.effective_scale(page)))
+            .map(|annotation| annotation.id);
+
+        if response.clicked() {
+            self.selected = hit.map(|id| (page, id));
+            return;
+        }
 
         if response.drag_started() {
-            // Pick the topmost annotation under the pointer.
-            let mut hit = None;
-            for a in doc.annotations[page].iter().rev() {
-                if a.contains_point(x, y, 5.0 / self.effective_scale(page)) {
-                    hit = Some(a.id);
-                    break;
-                }
-            }
-
             self.selected = hit.map(|id| (page, id));
 
             if let Some(id) = hit
