@@ -1,0 +1,30 @@
+[package]
+name = "pdf-viewer"
+version = "0.1.0"
+edition = "2024"
+description = "A Rust PDF viewer and editor built with egui — view, annotate, edit, save."
+
+[lib]
+name = "pdf_viewer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pdf-viewer"
+path = "src/main.rs"
+
+[[bin]]
+name = "pdf-editor"
+path = "src/editor/main.rs"
+
+[dependencies]
+eframe = "0.37"
+egui = "0.37"
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_7763", "thread_safe", "image_latest"] }
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# Keep the release binary lean; dev builds stay fast.
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
