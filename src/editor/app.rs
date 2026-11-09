@@ -1,5 +1,6 @@
 //! The editor application: UI, canvas interaction, and document operations.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -40,6 +41,7 @@ pub struct EditorApp {
     thumb_pending: Arc<Mutex<Vec<(usize, egui::ColorImage)>>>,
     thumb_rendering: Arc<Mutex<Vec<usize>>>,
     thumbs: Vec<(usize, egui::TextureHandle)>,
+    stamp_textures: HashMap<String, egui::TextureHandle>,
 
     page_input: String,
 
@@ -87,6 +89,7 @@ impl EditorApp {
             thumb_pending: Arc::new(Mutex::new(Vec::new())),
             thumb_rendering: Arc::new(Mutex::new(Vec::new())),
             thumbs: Vec::new(),
+            stamp_textures: HashMap::new(),
             page_input: String::new(),
             tool: Tool::Select,
             color: [230, 30, 30, 255],
@@ -398,6 +401,41 @@ impl EditorApp {
             self.thumbs.retain(|(p, _)| *p != page);
             self.thumbs.push((page, texture));
         }
+    }
+
+    fn ensure_stamp_textures(&mut self, ctx: &egui::Context) {
+        let mut needed = HashSet::new();
+        if let Some(document) = self.document.as_ref() {
+            for annotation in document.annotations.iter().flatten() {
+                if annotation.kind == AnnotationKind::Stamp
+                    && let Some(path) = annotation.image_path.as_ref()
+                {
+                    needed.insert(path.clone());
+                }
+            }
+        }
+
+        for path in &needed {
+            if self.stamp_textures.contains_key(path) {
+                continue;
+            }
+            let Ok(image) = image::open(path) else {
+                continue;
+            };
+            let rgba = image.to_rgba8();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [rgba.width() as usize, rgba.height() as usize],
+                rgba.as_raw(),
+            );
+            let texture = ctx.load_texture(
+                format!("stamp:{path}"),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.stamp_textures.insert(path.clone(), texture);
+        }
+
+        self.stamp_textures.retain(|path, _| needed.contains(path));
     }
 
     fn cached_scale(&self, page: usize) -> Option<f32> {
@@ -945,6 +983,8 @@ impl EditorApp {
             return;
         }
 
+        self.ensure_stamp_textures(ui.ctx());
+
         if let Some(err) = self.error.take() {
             ui.centered_and_justified(|ui| {
                 ui.colored_label(egui::Color32::from_rgb(240, 120, 100), err);
@@ -1143,14 +1183,16 @@ impl EditorApp {
                 }
             }
             AnnotationKind::Stamp => {
-                // The rendered page texture already contains the stamp; draw a
-                // light border so it is selectable.
-                painter.rect_stroke(
-                    rect,
-                    0.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
-                    egui::StrokeKind::Middle,
-                );
+                if let Some(path) = a.image_path.as_ref()
+                    && let Some(texture) = self.stamp_textures.get(path)
+                {
+                    painter.image(
+                        texture.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
             }
         }
 

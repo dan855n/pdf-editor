@@ -8,6 +8,7 @@ use pdfium_render::prelude::*;
 use crate::annotations::{Annotation, AnnotationKind, StrokeStyle};
 
 const ELLIPSE_CONTENTS_MARKER: &str = "__pdf_editor_ellipse__";
+const IMAGE_CONTENTS_MARKER: &str = "__pdf_editor_image__";
 
 /// A page's geometry.
 #[derive(Debug, Clone, Copy)]
@@ -338,15 +339,22 @@ impl OpenDocument {
                 let img = image::open(image_path).map_err(|e| {
                     DocumentError(format!("could not load image {image_path}: {e}"))
                 })?;
-                let obj = PdfPageImageObject::new_with_size(
+                let mut obj = PdfPageImageObject::new_with_size(
                     &self.doc,
                     &img,
                     PdfPoints::new(w),
                     PdfPoints::new(h),
                 )?;
+                obj.translate(PdfPoints::new(l), PdfPoints::new(b))?;
+                pdf_page.objects_mut().add_image_object(obj)?;
+
+                // Keep a hidden marker annotation so the editor can recover
+                // selection and deletion metadata after the PDF is reopened.
                 let mut a = pdf_page.annotations_mut().create_stamp_annotation()?;
                 a.set_bounds(PdfRect::new_from_values(b, l, t, r))?;
-                a.objects_mut().add_image_object(obj)?;
+                a.set_contents(IMAGE_CONTENTS_MARKER)?;
+                a.set_is_hidden(true)?;
+                a.set_is_invisible_if_unsupported(true)?;
             }
         }
 
@@ -363,6 +371,30 @@ impl OpenDocument {
         // id, so geometry plus subtype is the most reliable handle we have.
         let wanted = annotation.kind;
         let (l, b, r, t) = annotation.bounds_f32();
+
+        if wanted == AnnotationKind::Stamp {
+            let mut pdf_page = self.doc.pages_mut().get(page as i32)?;
+            let mut object_index = None;
+            for (index, object) in pdf_page.objects().iter().enumerate() {
+                let Some(image) = object.as_image_object() else {
+                    continue;
+                };
+                let Ok(bounds) = image.bounds() else {
+                    continue;
+                };
+                if (bounds.left().value - l).abs() < 1.5
+                    && (bounds.bottom().value - b).abs() < 1.5
+                    && (bounds.right().value - r).abs() < 1.5
+                    && (bounds.top().value - t).abs() < 1.5
+                {
+                    object_index = Some(index);
+                    break;
+                }
+            }
+            if let Some(index) = object_index {
+                pdf_page.objects_mut().remove_object_at_index(index)?;
+            }
+        }
 
         // Collect the match first so we're not holding a borrow on the page
         // while deleting. Annotation handles borrow their page, so match by
@@ -595,9 +627,19 @@ mod tests {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("test.pdf");
         let first_path = unique_pdf_path("round-trip");
         let second_path = unique_pdf_path("deleted");
+        let image_path = unique_pdf_path("stamp").with_extension("png");
 
         let mut document = OpenDocument::load(pdfium, &source).unwrap();
         let original_count = document.annotations[0].len();
+        let original_image_count = document
+            .doc
+            .pages()
+            .get(0)
+            .unwrap()
+            .objects()
+            .iter()
+            .filter(|object| object.as_image_object().is_some())
+            .count();
 
         let mut highlight = Annotation::new(0, AnnotationKind::Highlight);
         highlight.rect = PdfRect::new_from_values(40.0, 40.0, 220.0, 90.0);
@@ -612,10 +654,19 @@ mod tests {
             width: 2.0,
         };
         document.add_annotation(0, ellipse).unwrap();
+
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([220, 30, 30, 255]))
+            .save(&image_path)
+            .unwrap();
+        let mut stamp = Annotation::new(0, AnnotationKind::Stamp);
+        stamp.rect = PdfRect::new_from_values(300.0, 300.0, 360.0, 360.0);
+        stamp.image_path = Some(image_path.to_string_lossy().into_owned());
+        stamp.image_size = Some((60.0, 60.0));
+        document.add_annotation(0, stamp).unwrap();
         document.save_as(&first_path).unwrap();
 
         let mut reloaded = OpenDocument::load(pdfium, &first_path).unwrap();
-        assert_eq!(reloaded.annotations[0].len(), original_count + 2);
+        assert_eq!(reloaded.annotations[0].len(), original_count + 3);
         assert!(
             reloaded.annotations[0]
                 .iter()
@@ -625,6 +676,23 @@ mod tests {
             reloaded.annotations[0]
                 .iter()
                 .any(|annotation| annotation.kind == AnnotationKind::Ellipse)
+        );
+        assert!(
+            reloaded.annotations[0]
+                .iter()
+                .any(|annotation| annotation.kind == AnnotationKind::Stamp)
+        );
+        assert_eq!(
+            reloaded
+                .doc
+                .pages()
+                .get(0)
+                .unwrap()
+                .objects()
+                .iter()
+                .filter(|object| object.as_image_object().is_some())
+                .count(),
+            original_image_count + 1
         );
 
         let mut moved_highlight = reloaded.annotations[0]
@@ -648,7 +716,7 @@ mod tests {
             .filter(|annotation| {
                 matches!(
                     annotation.kind,
-                    AnnotationKind::Highlight | AnnotationKind::Ellipse
+                    AnnotationKind::Highlight | AnnotationKind::Ellipse | AnnotationKind::Stamp
                 )
             })
             .map(|annotation| annotation.id)
@@ -660,8 +728,21 @@ mod tests {
 
         let final_document = OpenDocument::load(pdfium, &second_path).unwrap();
         assert_eq!(final_document.annotations[0].len(), original_count);
+        assert_eq!(
+            final_document
+                .doc
+                .pages()
+                .get(0)
+                .unwrap()
+                .objects()
+                .iter()
+                .filter(|object| object.as_image_object().is_some())
+                .count(),
+            original_image_count
+        );
 
         let _ = std::fs::remove_file(first_path);
         let _ = std::fs::remove_file(second_path);
+        let _ = std::fs::remove_file(image_path);
     }
 }
