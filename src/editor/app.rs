@@ -1009,7 +1009,8 @@ impl EditorApp {
             ui.vertical_centered(|ui| {
                 for page in 0..total {
                     let size = self.page_size_px(page);
-                    let (page_rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                    let (page_rect, response) =
+                        ui.allocate_exact_size(size, egui::Sense::click_and_drag());
                     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                     if let Some((_, c)) = self.cache.iter().find(|(p, _)| *p == page) {
                         ui.painter()
@@ -1383,8 +1384,11 @@ impl EditorApp {
             Some(k) => k,
             None => return,
         };
+        if !inside {
+            return;
+        }
 
-        if response.drag_started() && inside {
+        if response.drag_started() {
             self.interaction = Interaction::Drawing {
                 kind,
                 drag: DragState {
@@ -1392,6 +1396,30 @@ impl EditorApp {
                     current: pos,
                 },
             };
+        }
+        if response.dragged()
+            && let Interaction::Drawing { drag, .. } = &mut self.interaction
+        {
+            drag.current = pos;
+        }
+        if response.drag_stopped()
+            && let Interaction::Drawing { kind, drag } = self.interaction
+        {
+            self.interaction = Interaction::None;
+            self.finish_drawing(kind, drag);
+        }
+        if response.clicked() {
+            let drag = match kind {
+                AnnotationKind::Highlight => DragState {
+                    start: egui::pos2(pos.x, pos.y - 12.0),
+                    current: egui::pos2(pos.x + 140.0, pos.y + 12.0),
+                },
+                _ => DragState {
+                    start: egui::pos2(pos.x - 50.0, pos.y - 35.0),
+                    current: egui::pos2(pos.x + 50.0, pos.y + 35.0),
+                },
+            };
+            self.finish_drawing(kind, drag);
         }
     }
 
@@ -1462,25 +1490,7 @@ impl EditorApp {
                         _ => return,
                     };
                     self.interaction = Interaction::None;
-                    let rect = egui::Rect::from_min_max(drag.start, drag.current);
-                    if rect.width() < 3.0 && rect.height() < 3.0 {
-                        return; // accidental click
-                    }
-                    if let Some(page) = self.page_at_screen_pos(drag.start)
-                        && let Some(pr) = self.page_rect_at(page)
-                    {
-                        let to_pdf = |p: egui::Pos2| self.screen_to_pdf(page, pr, p);
-                        let mut a = annotation_from_drag(
-                            0,
-                            kind,
-                            self.current_style(),
-                            drag.start,
-                            drag.current,
-                            to_pdf,
-                        );
-                        a.font_size = self.font_size;
-                        self.commit_annotation(a);
-                    }
+                    self.finish_drawing(kind, drag);
                 }
             }
             Interaction::Inking { page, mut points } => {
@@ -1591,6 +1601,28 @@ impl EditorApp {
                 }
             }
             Interaction::None => {}
+        }
+    }
+
+    fn finish_drawing(&mut self, kind: AnnotationKind, drag: DragState) {
+        let rect = egui::Rect::from_min_max(drag.start, drag.current);
+        if rect.width() < 3.0 && rect.height() < 3.0 {
+            return;
+        }
+        if let Some(page) = self.page_at_screen_pos(drag.start)
+            && let Some(pr) = self.page_rect_at(page)
+        {
+            let to_pdf = |p: egui::Pos2| self.screen_to_pdf(page, pr, p);
+            let mut annotation = annotation_from_drag(
+                0,
+                kind,
+                self.current_style(),
+                drag.start,
+                drag.current,
+                to_pdf,
+            );
+            annotation.font_size = self.font_size;
+            self.commit_annotation(annotation);
         }
     }
 

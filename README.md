@@ -12,6 +12,11 @@ tools:
 - Page insertion, deletion, and rotation
 - Continuous scrolling and background-rendered page thumbnails
 
+This is an annotation editor: it does not rewrite text already embedded in the
+PDF. Highlight, rectangle, and ellipse tools accept either a click (creating a
+default-sized mark) or a click-and-drag. Use the Select tool afterward to move
+or resize a mark, and use Delete or the toolbar button to remove it.
+
 Run it with:
 
 ```sh
