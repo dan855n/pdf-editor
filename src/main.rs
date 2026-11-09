@@ -4,11 +4,11 @@
 //! Enter / Shift-Enter navigation between results.
 
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use eframe::egui;
-use pdfium_render::prelude::*;
 use pdf_viewer::load_pdfium_bindings;
+use pdfium_render::prelude::*;
 
 const GAP: f32 = 16.0; // gap between pages when scrolling
 
@@ -84,8 +84,7 @@ struct OpenDocument {
 }
 
 fn meta(doc: &PdfDocument<'_>, tag: PdfDocumentMetadataTagType) -> String {
-    doc
-        .metadata()
+    doc.metadata()
         .get(tag)
         .map(|t| t.value().to_owned())
         .unwrap_or_default()
@@ -328,10 +327,15 @@ impl PdfViewerApp {
         }
         drop(rendering);
 
-        let free = Self::MAX_CONCURRENT_RENDERS.saturating_sub(self.rendering.lock().unwrap().len());
+        let free =
+            Self::MAX_CONCURRENT_RENDERS.saturating_sub(self.rendering.lock().unwrap().len());
         for page in queue.into_iter().take(free) {
-            let Some(scale) = scale_ok(page) else { continue };
-            let Some(doc) = self.document.as_ref() else { return };
+            let Some(scale) = scale_ok(page) else {
+                continue;
+            };
+            let Some(doc) = self.document.as_ref() else {
+                return;
+            };
             let doc_arc = Arc::clone(&doc.doc);
             let pending = Arc::clone(&self.pending);
             let rendering = Arc::clone(&self.rendering);
@@ -367,7 +371,9 @@ impl PdfViewerApp {
         if !self.show_thumbs {
             return;
         }
-        let Some(doc) = self.document.as_ref() else { return };
+        let Some(doc) = self.document.as_ref() else {
+            return;
+        };
         let total = doc.page_count;
 
         const THUMB_W_PX: i32 = 140;
@@ -414,11 +420,9 @@ impl PdfViewerApp {
     fn upload_thumbnails(&mut self, ui: &egui::Ui) {
         let ready = std::mem::take(&mut *self.thumb_pending.lock().unwrap());
         for (page, image) in ready {
-            let texture = ui.ctx().load_texture(
-                format!("thumb-{page}"),
-                image,
-                egui::TextureOptions::LINEAR,
-            );
+            let texture =
+                ui.ctx()
+                    .load_texture(format!("thumb-{page}"), image, egui::TextureOptions::LINEAR);
             self.thumbs.retain(|(p, _)| *p != page);
             self.thumbs.push((page, texture));
         }
@@ -428,7 +432,9 @@ impl PdfViewerApp {
     /// worker runs on its own thread so large documents don't freeze the UI;
     /// results are posted back and applied by [`Self::poll_search`].
     fn start_search(&mut self, query: &str) {
-        let Some(doc) = self.document.as_ref() else { return };
+        let Some(doc) = self.document.as_ref() else {
+            return;
+        };
         let query = query.trim().to_owned();
         if query.is_empty() {
             self.search_hits.clear();
@@ -613,15 +619,10 @@ impl PdfViewerApp {
 
                     // Typing into the field triggers a fresh search immediately.
 
-
                     // Enter / Shift+Enter navigate hits while the field is focused.
                     if focused_now {
-                        let (enter, shift) = ui.input(|i| {
-                            (
-                                i.key_pressed(egui::Key::Enter),
-                                i.modifiers.shift,
-                            )
-                        });
+                        let (enter, shift) =
+                            ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
                         if enter {
                             let q = self.search_query.trim().to_owned();
                             if q.is_empty() {
@@ -710,10 +711,11 @@ impl PdfViewerApp {
                     ui.label(format!("of {total}"));
                     let commit = re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if commit {
-                        if let Ok(n) = self.page_input.trim().parse::<usize>() {
-                            if n >= 1 && n <= total {
-                                self.go_to(n - 1);
-                            }
+                        if let Ok(n) = self.page_input.trim().parse::<usize>()
+                            && n >= 1
+                            && n <= total
+                        {
+                            self.go_to(n - 1);
                         }
                         self.page_input.clear();
                         re.request_focus();
@@ -833,14 +835,18 @@ impl PdfViewerApp {
                     let size = self.page_size_px(page);
                     if let Some((_, c)) = self.cache.iter().find(|(p, _)| *p == page) {
                         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                        ui.painter().rect_filled(rect.expand(1.0), 2.0, egui::Color32::WHITE);
-                        ui.painter().image(c.texture.id(), rect, uv, egui::Color32::WHITE);
+                        let uv =
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        ui.painter()
+                            .rect_filled(rect.expand(1.0), 2.0, egui::Color32::WHITE);
+                        ui.painter()
+                            .image(c.texture.id(), rect, uv, egui::Color32::WHITE);
                         last_rect = rect;
                     } else {
                         // Grey placeholder sized like the real page.
                         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(70));
+                        ui.painter()
+                            .rect_filled(rect, 2.0, egui::Color32::from_gray(70));
                         if rect.intersects(ui.clip_rect()) {
                             last_rect = rect;
                             let label = format!("{}", page + 1);
@@ -944,7 +950,9 @@ impl PdfViewerApp {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let Some(doc) = self.document.as_ref() else { return };
+        let Some(doc) = self.document.as_ref() else {
+            return;
+        };
         let total = doc.page_count;
         let current = self.current_page;
         let aspects: Vec<f32> = (0..total)
@@ -958,8 +966,7 @@ impl PdfViewerApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    for page in 0..total {
-                        let aspect = aspects[page];
+                    for (page, &aspect) in aspects.iter().enumerate().take(total) {
                         let thumb_w = (ui.available_width() - 8.0).min(150.0);
                         let size = egui::vec2(thumb_w, thumb_w / aspect);
 
@@ -978,8 +985,7 @@ impl PdfViewerApp {
                         // response only senses hover, so interact over its rect.
                         let inner = frame.show(ui, |ui| {
                             ui.vertical_centered(|ui| {
-                                if let Some((_, tex)) =
-                                    self.thumbs.iter().find(|(p, _)| *p == page)
+                                if let Some((_, tex)) = self.thumbs.iter().find(|(p, _)| *p == page)
                                 {
                                     let img = egui::Image::from_texture(tex)
                                         .max_size(size)
@@ -991,18 +997,24 @@ impl PdfViewerApp {
                                     ui.painter().rect_filled(
                                         rect,
                                         2.0,
-                                        egui::Color32::from_gray(if page == current { 90 } else { 55 }),
+                                        egui::Color32::from_gray(if page == current {
+                                            90
+                                        } else {
+                                            55
+                                        }),
                                     );
                                 }
                                 ui.label(
-                                    egui::RichText::new(format!("{}", page + 1))
-                                        .small()
-                                        .weak(),
+                                    egui::RichText::new(format!("{}", page + 1)).small().weak(),
                                 );
                             });
                         });
 
-                        let click = ui.interact(inner.response.rect, ui.scope_id().with(("thumb", page)), egui::Sense::click());
+                        let click = ui.interact(
+                            inner.response.rect,
+                            ui.scope_id().with(("thumb", page)),
+                            egui::Sense::click(),
+                        );
                         if click.clicked() {
                             self.go_to(page);
                         }
@@ -1062,7 +1074,9 @@ impl PdfViewerApp {
     // --------------------------------------------------------------- actions
 
     fn go_to(&mut self, page: usize) {
-        let Some(doc) = self.document.as_ref() else { return };
+        let Some(doc) = self.document.as_ref() else {
+            return;
+        };
         let page = page.min(doc.page_count.saturating_sub(1));
         self.current_page = page;
         self.scroll_target = Some(page);
@@ -1096,7 +1110,6 @@ impl PdfViewerApp {
 
 impl eframe::App for PdfViewerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-
         // Load a PDF if a native file dialog just finished.
         self.poll_open_dialog();
 
@@ -1104,7 +1117,6 @@ impl eframe::App for PdfViewerApp {
         self.poll_search();
 
         let typing = ctx.memory(|m| m.focused().is_some());
-
 
         // ⌘F / Ctrl-F focuses the search field. Match the raw event so the
         // mac_cmd flag path is covered regardless of Modifiers.command timing.
@@ -1146,8 +1158,15 @@ impl eframe::App for PdfViewerApp {
         if !typing {
             // Bare number keys 1-9 jump straight to that page.
             for k in [
-                egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5,
-                egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+                egui::Key::Num6,
+                egui::Key::Num7,
+                egui::Key::Num8,
+                egui::Key::Num9,
             ] {
                 if ctx.input(|i| i.key_pressed(k)) {
                     self.go_to((k as usize) - (egui::Key::Num1 as usize));
@@ -1172,10 +1191,8 @@ impl eframe::App for PdfViewerApp {
             if home {
                 self.go_to(0);
             }
-            if end {
-                if let Some(d) = self.document.as_ref() {
-                    self.go_to(d.page_count.saturating_sub(1));
-                }
+            if end && let Some(d) = self.document.as_ref() {
+                self.go_to(d.page_count.saturating_sub(1));
             }
             if plus {
                 self.zoom_in();
@@ -1239,7 +1256,10 @@ fn read_last_state() -> Option<(PathBuf, usize)> {
     let txt = std::fs::read_to_string(state_path()).ok()?;
     let mut lines = txt.lines();
     let path = PathBuf::from(lines.next()?);
-    let page = lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
+    let page = lines
+        .next()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(0);
     path.exists().then_some((path, page))
 }
 
@@ -1299,9 +1319,13 @@ fn search_all_pages(doc: &PdfDocument<'static>, query: &str) -> Vec<SearchHit> {
     let page_count = doc.pages().len().max(0) as usize;
 
     for p in 0..page_count {
-        let Ok(page) = doc.pages().get(p as i32) else { continue };
+        let Ok(page) = doc.pages().get(p as i32) else {
+            continue;
+        };
         let Ok(text) = page.text() else { continue };
-        let Ok(search) = text.search(query, &options) else { continue };
+        let Ok(search) = text.search(query, &options) else {
+            continue;
+        };
         for segments in search.iter(PdfSearchDirection::SearchForward) {
             // Union of the segment rects that make up this hit.
             let mut l = f32::MAX;

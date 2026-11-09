@@ -11,15 +11,16 @@ mod undo;
 pub use app::EditorApp;
 
 use eframe::egui;
+use pdfium_render::prelude::Pdfium;
 
 /// Entry point for the `pdf-editor` binary.
 pub fn main() -> eframe::Result {
-    let pdfium = pdfium_render::Pdfium::new(pdf_viewer::load_pdfium_bindings());
+    let pdfium = Pdfium::new(pdf_viewer::load_pdfium_bindings());
 
     // `PdfDocument<'a>` borrows the `Pdfium` instance. Leaking the single
     // Pdfium keeps the lifetime plumbing simple; documents are still closed
     // properly when replaced (their Drop calls FPDF_CloseDocument).
-    let pdfium: &'static pdfium_render::Pdfium = Box::leak(Box::new(pdfium));
+    let pdfium: &'static Pdfium = Box::leak(Box::new(pdfium));
 
     let mut app = EditorApp::new(pdfium);
 
@@ -43,7 +44,7 @@ pub fn main() -> eframe::Result {
         "pdf-editor",
         options,
         Box::new(move |cc| {
-            egui::Context::set_theme(cc.egui_ctx.clone(), egui::Theme::Dark);
+            cc.egui_ctx.set_theme(egui::Theme::Dark);
             Ok(Box::new(app))
         }),
     )

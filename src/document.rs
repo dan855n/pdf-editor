@@ -7,6 +7,8 @@ use pdfium_render::prelude::*;
 
 use crate::annotations::{Annotation, AnnotationKind, StrokeStyle};
 
+const ELLIPSE_CONTENTS_MARKER: &str = "__pdf_editor_ellipse__";
+
 /// A page's geometry.
 #[derive(Debug, Clone, Copy)]
 pub struct PageInfo {
@@ -180,9 +182,10 @@ impl OpenDocument {
     pub fn update_annotation(
         &mut self,
         page: usize,
-        mut annotation: Annotation,
+        annotation: Annotation,
     ) -> Result<(), DocumentError> {
         // Remove the old PDF annotation, then create the updated one.
+        let id = annotation.id;
         if let Some(old) = self
             .annotations
             .get(page)
@@ -192,13 +195,13 @@ impl OpenDocument {
             self.remove_annotation_from_pdf(page, &old)?;
         }
 
-        annotation.id = self.next_id;
-        self.next_id += 1;
-
         self.apply_annotation(page, &annotation)?;
         if let Some(list) = self.annotations.get_mut(page) {
-            list.retain(|a| a.id != annotation.id);
-            list.push(annotation);
+            if let Some(existing) = list.iter_mut().find(|a| a.id == id) {
+                *existing = annotation;
+            } else {
+                list.push(annotation);
+            }
         }
         Ok(())
     }
@@ -291,6 +294,7 @@ impl OpenDocument {
                 // ellipse is a stamp annotation carrying a vector ellipse path.
                 let mut a = pdf_page.annotations_mut().create_stamp_annotation()?;
                 a.set_bounds(PdfRect::new_from_values(b, l, t, r))?;
+                a.set_contents(ELLIPSE_CONTENTS_MARKER)?;
                 let cx = (l + r) / 2.0;
                 let cy = (b + t) / 2.0;
                 let path = PdfPagePathObject::new_ellipse_at(
@@ -312,9 +316,9 @@ impl OpenDocument {
             }
 
             AnnotationKind::FreeText => {
-                let mut a = pdf_page.annotations_mut().create_free_text_annotation(
-                    annotation.text.as_str(),
-                )?;
+                let mut a = pdf_page
+                    .annotations_mut()
+                    .create_free_text_annotation(annotation.text.as_str())?;
                 a.set_bounds(PdfRect::new_from_values(b, l, t, r))?;
                 if let Some(stroke) = annotation.style.stroke {
                     a.set_stroke_color(crate::annotations::rgba_to_pdf_color(stroke))?;
@@ -331,8 +335,9 @@ impl OpenDocument {
                 let Some((w, h)) = annotation.image_size else {
                     return Ok(());
                 };
-                let img = image::open(image_path)
-                    .map_err(|e| DocumentError(format!("could not load image {image_path}: {e}")))?;
+                let img = image::open(image_path).map_err(|e| {
+                    DocumentError(format!("could not load image {image_path}: {e}"))
+                })?;
                 let obj = PdfPageImageObject::new_with_size(
                     &self.doc,
                     &img,
@@ -419,10 +424,17 @@ impl OpenDocument {
             .pages
             .get(after.min(self.page_count.saturating_sub(1)))
             .copied()
-            .map(|p| PdfPagePaperSize::new_custom(PdfPoints::new(p.width_pts), PdfPoints::new(p.height_pts)))
+            .map(|p| {
+                PdfPagePaperSize::new_custom(
+                    PdfPoints::new(p.width_pts),
+                    PdfPoints::new(p.height_pts),
+                )
+            })
             .unwrap_or_else(PdfPagePaperSize::a4);
         let index = (after + 1).min(self.page_count);
-        self.doc.pages_mut().create_page_at_index(size, index as i32)?;
+        self.doc
+            .pages_mut()
+            .create_page_at_index(size, index as i32)?;
         self.annotations.insert(index, Vec::new());
         self.refresh_pages()?;
         Ok(())
@@ -467,11 +479,6 @@ impl OpenDocument {
     }
 }
 
-/// Helper: borrow the document out of the struct while it's being built.
-fn open_doc_ref(open: &OpenDocument) -> &PdfDocument<'static> {
-    &open.doc
-}
-
 /// Map a PDFium annotation to the editor's [`AnnotationKind`], if supported.
 fn kind_of(annotation: &PdfPageAnnotation<'_>) -> Option<AnnotationKind> {
     match annotation.annotation_type() {
@@ -480,6 +487,11 @@ fn kind_of(annotation: &PdfPageAnnotation<'_>) -> Option<AnnotationKind> {
         PdfPageAnnotationType::Square => Some(AnnotationKind::Rectangle),
         PdfPageAnnotationType::Circle => Some(AnnotationKind::Ellipse),
         PdfPageAnnotationType::FreeText => Some(AnnotationKind::FreeText),
+        PdfPageAnnotationType::Stamp
+            if annotation.contents().as_deref() == Some(ELLIPSE_CONTENTS_MARKER) =>
+        {
+            Some(AnnotationKind::Ellipse)
+        }
         PdfPageAnnotationType::Stamp => Some(AnnotationKind::Stamp),
         _ => None,
     }
@@ -494,12 +506,16 @@ fn meta(doc: &PdfDocument<'_>, tag: PdfDocumentMetadataTagType) -> String {
 
 /// Convert a PDFium annotation into the editor's plain-data model.
 fn annotation_to_model(annotation: &PdfPageAnnotation<'_>, id: u64) -> Option<Annotation> {
+    let contents = annotation.contents().unwrap_or_default();
     let kind = match annotation.annotation_type() {
         PdfPageAnnotationType::Highlight => AnnotationKind::Highlight,
         PdfPageAnnotationType::Ink => AnnotationKind::Ink,
         PdfPageAnnotationType::Square => AnnotationKind::Rectangle,
         PdfPageAnnotationType::Circle => AnnotationKind::Ellipse,
         PdfPageAnnotationType::FreeText => AnnotationKind::FreeText,
+        PdfPageAnnotationType::Stamp if contents == ELLIPSE_CONTENTS_MARKER => {
+            AnnotationKind::Ellipse
+        }
         PdfPageAnnotationType::Stamp => AnnotationKind::Stamp,
         _ => return None,
     };
@@ -514,10 +530,15 @@ fn annotation_to_model(annotation: &PdfPageAnnotation<'_>, id: u64) -> Option<An
 
     let mut model = Annotation::new(id, kind);
     model.rect = PdfRect::new_from_values(b, l, t, r);
-    model.text = annotation.contents().unwrap_or_default();
+    if kind != AnnotationKind::Ellipse {
+        model.text = contents;
+    }
 
     let style = StrokeStyle {
-        fill: annotation.fill_color().ok().map(crate::annotations::pdf_color_to_rgba),
+        fill: annotation
+            .fill_color()
+            .ok()
+            .map(crate::annotations::pdf_color_to_rgba),
         stroke: annotation
             .stroke_color()
             .ok()
@@ -549,4 +570,98 @@ fn annotation_to_model(annotation: &PdfPageAnnotation<'_>, id: u64) -> Option<An
     }
 
     Some(model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_pdf_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pdf-viewer-{label}-{}-{nonce}.pdf",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn annotations_round_trip_and_delete() {
+        let pdfium: &'static Pdfium =
+            Box::leak(Box::new(Pdfium::new(crate::load_pdfium_bindings())));
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("test.pdf");
+        let first_path = unique_pdf_path("round-trip");
+        let second_path = unique_pdf_path("deleted");
+
+        let mut document = OpenDocument::load(pdfium, &source).unwrap();
+        let original_count = document.annotations[0].len();
+
+        let mut highlight = Annotation::new(0, AnnotationKind::Highlight);
+        highlight.rect = PdfRect::new_from_values(40.0, 40.0, 220.0, 90.0);
+        highlight.style = StrokeStyle::highlight();
+        document.add_annotation(0, highlight).unwrap();
+
+        let mut ellipse = Annotation::new(0, AnnotationKind::Ellipse);
+        ellipse.rect = PdfRect::new_from_values(80.0, 120.0, 260.0, 210.0);
+        ellipse.style = StrokeStyle {
+            fill: Some([255, 220, 0, 80]),
+            stroke: Some([220, 40, 40, 255]),
+            width: 2.0,
+        };
+        document.add_annotation(0, ellipse).unwrap();
+        document.save_as(&first_path).unwrap();
+
+        let mut reloaded = OpenDocument::load(pdfium, &first_path).unwrap();
+        assert_eq!(reloaded.annotations[0].len(), original_count + 2);
+        assert!(
+            reloaded.annotations[0]
+                .iter()
+                .any(|annotation| annotation.kind == AnnotationKind::Highlight)
+        );
+        assert!(
+            reloaded.annotations[0]
+                .iter()
+                .any(|annotation| annotation.kind == AnnotationKind::Ellipse)
+        );
+
+        let mut moved_highlight = reloaded.annotations[0]
+            .iter()
+            .find(|annotation| annotation.kind == AnnotationKind::Highlight)
+            .cloned()
+            .unwrap();
+        let highlight_id = moved_highlight.id;
+        moved_highlight.rect = PdfRect::new_from_values(55.0, 50.0, 235.0, 100.0);
+        reloaded.update_annotation(0, moved_highlight).unwrap();
+        assert_eq!(
+            reloaded.annotations[0]
+                .iter()
+                .filter(|annotation| annotation.id == highlight_id)
+                .count(),
+            1
+        );
+
+        let ids: Vec<u64> = reloaded.annotations[0]
+            .iter()
+            .filter(|annotation| {
+                matches!(
+                    annotation.kind,
+                    AnnotationKind::Highlight | AnnotationKind::Ellipse
+                )
+            })
+            .map(|annotation| annotation.id)
+            .collect();
+        for id in ids {
+            reloaded.delete_annotation(0, id).unwrap();
+        }
+        reloaded.save_as(&second_path).unwrap();
+
+        let final_document = OpenDocument::load(pdfium, &second_path).unwrap();
+        assert_eq!(final_document.annotations[0].len(), original_count);
+
+        let _ = std::fs::remove_file(first_path);
+        let _ = std::fs::remove_file(second_path);
+    }
 }

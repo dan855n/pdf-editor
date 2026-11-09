@@ -1,4 +1,35 @@
-# pdf-viewer — a Rust PDF viewer, built in stages
+# pdf-viewer — a Rust PDF viewer and editor
+
+## PDF editor
+
+The `pdf-editor` binary extends the viewer with annotation and page-editing
+tools:
+
+- Highlight, ink, rectangle, ellipse, text, and image annotations
+- Selection, movement, and corner-handle resizing
+- Annotation undo/redo backed by snapshots
+- Save and Save As while preserving editable PDF annotations
+- Page insertion, deletion, and rotation
+- Continuous scrolling and background-rendered page thumbnails
+
+Run it with:
+
+```sh
+cargo run --bin pdf-editor -- test.pdf
+```
+
+The editor targets `eframe`/`egui` 0.37. PDFium does not expose a public circle
+annotation constructor, so ellipses are written as stamp annotations containing
+vector ellipse paths. A contents marker preserves their ellipse identity when
+the document is reopened.
+
+Verification:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
 
 ## Stage 4 (code complete — awaiting your manual test): search
 

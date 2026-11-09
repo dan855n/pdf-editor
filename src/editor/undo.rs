@@ -66,26 +66,24 @@ impl UndoStack {
 
     /// Take the step that would be undone, leaving it on the redo stack.
     pub fn take_undo(&mut self) -> Option<Step> {
-        self.past.pop().map(|step| {
-            self.future.push(Step {
-                label: step.label.clone(),
-                before: step.before.clone(),
-                after: step.after.clone(),
-            });
-            step
-        })
+        let step = self.past.pop()?;
+        self.future.push(Step {
+            label: step.label.clone(),
+            before: step.before.clone(),
+            after: step.after.clone(),
+        });
+        Some(step)
     }
 
     /// Take the step that would be redone, leaving it on the undo stack.
     pub fn take_redo(&mut self) -> Option<Step> {
-        self.future.pop().map(|step| {
-            self.past.push(Step {
-                label: step.label.clone(),
-                before: step.before.clone(),
-                after: step.after.clone(),
-            });
-            step
-        })
+        let step = self.future.pop()?;
+        self.past.push(Step {
+            label: step.label.clone(),
+            before: step.before.clone(),
+            after: step.after.clone(),
+        });
+        Some(step)
     }
 
     pub fn clear(&mut self) {

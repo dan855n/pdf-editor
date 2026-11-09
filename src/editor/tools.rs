@@ -93,7 +93,6 @@ pub enum Interaction {
     /// Moving an existing annotation.
     Moving {
         page: usize,
-        id: u64,
         /// Offset from the annotation's origin to the grab point, PDF points.
         grab_offset: (f32, f32),
         original: Annotation,
@@ -101,7 +100,6 @@ pub enum Interaction {
     /// Resizing an existing annotation from a corner.
     Resizing {
         page: usize,
-        id: u64,
         corner: ResizeCorner,
         original: Annotation,
     },

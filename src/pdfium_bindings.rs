@@ -15,11 +15,11 @@ pub fn load_pdfium_bindings() -> Box<dyn PdfiumLibraryBindings> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     // 1. Next to the executable (works for relocated / bundled builds).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("libpdfium.dylib"));
-            candidates.push(dir.join("deps").join("libpdfium.dylib"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("libpdfium.dylib"));
+        candidates.push(dir.join("deps").join("libpdfium.dylib"));
     }
     // 2. Vendored inside the source tree.
     candidates.push(PathBuf::from(library_dir()).join("libpdfium.dylib"));
@@ -38,7 +38,9 @@ pub fn load_pdfium_bindings() -> Box<dyn PdfiumLibraryBindings> {
         Ok(b) => b,
         Err(e) => panic!(
             "Could not load libpdfium.\nExpected it at {} or on the system library path.: {e}",
-            PathBuf::from(library_dir()).join("libpdfium.dylib").display()
+            PathBuf::from(library_dir())
+                .join("libpdfium.dylib")
+                .display()
         ),
     }
 }

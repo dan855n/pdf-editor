@@ -1,17 +1,15 @@
 //! The editor application: UI, canvas interaction, and document operations.
 
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use eframe::egui;
-use pdfium_render::prelude::*;
 use pdf_viewer::annotations::{Annotation, AnnotationKind, StrokeStyle};
-use pdf_viewer::{DocumentError, OpenDocument, SaveOptions};
+use pdf_viewer::{OpenDocument, SaveOptions};
+use pdfium_render::prelude::*;
 
-use crate::editor::tools::{
-    annotation_from_drag, DragState, Interaction, ResizeCorner, Tool,
-};
-use crate::editor::undo::UndoStack;
+use crate::tools::{DragState, Interaction, ResizeCorner, Tool, annotation_from_drag};
+use crate::undo::UndoStack;
 
 const GAP: f32 = 16.0;
 
@@ -22,28 +20,6 @@ type PendingTexture = Arc<Mutex<Option<(usize, f32, egui::ColorImage)>>>;
 struct CachedPage {
     scale: f32,
     texture: egui::TextureHandle,
-}
-
-/// Editor settings that persist between runs.
-#[derive(Debug, Clone)]
-struct EditorSettings {
-    tool: Tool,
-    color: [u8; 4],
-    fill: Option<[u8; 4]>,
-    stroke_width: f32,
-    font_size: f32,
-}
-
-impl Default for EditorSettings {
-    fn default() -> Self {
-        Self {
-            tool: Tool::Select,
-            color: [230, 30, 30, 255],
-            fill: None,
-            stroke_width: 2.0,
-            font_size: 14.0,
-        }
-    }
 }
 
 pub struct EditorApp {
@@ -81,9 +57,6 @@ pub struct EditorApp {
 
     /// Text being typed for a new free-text annotation.
     text_buffer: String,
-    /// Set when the text tool is waiting for a click to place the note.
-    text_pending: bool,
-
     /// Receiver for an in-flight native file dialog.
     open_pending: Option<mpsc::Receiver<Option<PathBuf>>>,
     save_pending: Option<mpsc::Receiver<Option<PathBuf>>>,
@@ -126,7 +99,6 @@ impl EditorApp {
             dirty: false,
             status: "Ready".into(),
             text_buffer: String::new(),
-            text_pending: false,
             open_pending: None,
             save_pending: None,
             image_pending: None,
@@ -233,7 +205,7 @@ impl EditorApp {
         }
     }
 
-    fn load_document(&mut self, path: &std::path::Path) {
+    pub(crate) fn load_document(&mut self, path: &std::path::Path) {
         match OpenDocument::load(self.pdfium, path) {
             Ok(doc) => {
                 self.document = Some(doc);
@@ -320,15 +292,19 @@ impl EditorApp {
         }
         drop(rendering);
 
-        let free = Self::MAX_CONCURRENT_RENDERS.saturating_sub(self.rendering.lock().unwrap().len());
+        let free =
+            Self::MAX_CONCURRENT_RENDERS.saturating_sub(self.rendering.lock().unwrap().len());
         for page in queue.into_iter().take(free) {
-            let Some(scale) = self.cached_scale(page).map(|_| ()).map_or_else(
-                || Some(self.effective_scale(page)),
-                |_| None,
-            ) else {
+            let Some(scale) = self
+                .cached_scale(page)
+                .map(|_| ())
+                .map_or_else(|| Some(self.effective_scale(page)), |_| None)
+            else {
                 continue;
             };
-            let Some(doc) = self.document.as_ref() else { return };
+            let Some(doc) = self.document.as_ref() else {
+                return;
+            };
             // Each render job gets its own read-only document handle.
             let doc_arc = match doc.render_docs.get(page % doc.render_docs.len().max(1)) {
                 Some(d) => Arc::clone(d),
@@ -365,7 +341,9 @@ impl EditorApp {
         if !self.show_thumbs {
             return;
         }
-        let Some(doc) = self.document.as_ref() else { return };
+        let Some(doc) = self.document.as_ref() else {
+            return;
+        };
         let total = doc.page_count;
 
         const THUMB_W_PX: i32 = 140;
@@ -414,11 +392,9 @@ impl EditorApp {
     fn upload_thumbnails(&mut self, ui: &egui::Ui) {
         let ready = std::mem::take(&mut *self.thumb_pending.lock().unwrap());
         for (page, image) in ready {
-            let texture = ui.ctx().load_texture(
-                format!("thumb-{page}"),
-                image,
-                egui::TextureOptions::LINEAR,
-            );
+            let texture =
+                ui.ctx()
+                    .load_texture(format!("thumb-{page}"), image, egui::TextureOptions::LINEAR);
             self.thumbs.retain(|(p, _)| *p != page);
             self.thumbs.push((page, texture));
         }
@@ -533,15 +509,20 @@ impl EditorApp {
         // ones in the snapshot.
         let page_count = doc.page_count;
         for page in 0..page_count {
-            let all: Vec<PdfPageAnnotation> = match doc.doc.pages().get(page as i32) {
-                Ok(p) => p.annotations().iter().collect(),
-                Err(_) => continue,
+            let Ok(mut pdf_page) = doc.doc.pages_mut().get(page as i32) else {
+                continue;
             };
-            for a in all {
-                let Ok(mut pdf_page) = doc.doc.pages_mut().get(page as i32) else {
+            loop {
+                let annotations = pdf_page.annotations_mut();
+                if annotations.is_empty() {
+                    break;
+                }
+                let Ok(annotation) = annotations.get(0) else {
                     break;
                 };
-                let _ = pdf_page.annotations_mut().delete_annotation(a);
+                if annotations.delete_annotation(annotation).is_err() {
+                    break;
+                }
             }
         }
 
@@ -573,7 +554,7 @@ impl EditorApp {
     }
 
     fn save(&mut self) {
-        let Some(doc) = self.document.as_ref() else {
+        let Some(doc) = self.document.as_mut() else {
             return;
         };
         match doc.save(SaveOptions::default()) {
@@ -631,7 +612,9 @@ impl EditorApp {
     // ------------------------------------------------------------ actions
 
     fn go_to(&mut self, page: usize) {
-        let Some(doc) = self.document.as_ref() else { return };
+        let Some(doc) = self.document.as_ref() else {
+            return;
+        };
         let page = page.min(doc.page_count.saturating_sub(1));
         self.current_page = page;
         self.scroll_target = Some(page);
@@ -651,7 +634,9 @@ impl EditorApp {
     }
 
     fn delete_page(&mut self) {
-        let Some(doc) = self.document.as_mut() else { return };
+        let Some(doc) = self.document.as_mut() else {
+            return;
+        };
         match doc.delete_page(self.current_page) {
             Ok(()) => {
                 self.dirty = true;
@@ -667,7 +652,9 @@ impl EditorApp {
     }
 
     fn insert_page(&mut self) {
-        let Some(doc) = self.document.as_mut() else { return };
+        let Some(doc) = self.document.as_mut() else {
+            return;
+        };
         match doc.insert_blank_page(self.current_page) {
             Ok(()) => {
                 self.dirty = true;
@@ -682,7 +669,9 @@ impl EditorApp {
     }
 
     fn rotate_page(&mut self) {
-        let Some(doc) = self.document.as_mut() else { return };
+        let Some(doc) = self.document.as_mut() else {
+            return;
+        };
         match doc.rotate_page(self.current_page) {
             Ok(()) => {
                 self.dirty = true;
@@ -815,9 +804,14 @@ impl EditorApp {
             ui.separator();
 
             ui.label("Colour:");
-            let mut c = self.color;
-            if ui.color_edit_button_srgba(&mut c.into()).changed() {
-                self.color = c;
+            let mut color = egui::Color32::from_rgba_unmultiplied(
+                self.color[0],
+                self.color[1],
+                self.color[2],
+                self.color[3],
+            );
+            if ui.color_edit_button_srgba(&mut color).changed() {
+                self.color = color.to_srgba_unmultiplied();
             }
 
             ui.separator();
@@ -828,9 +822,11 @@ impl EditorApp {
                 self.fill = if has_fill { Some(self.color) } else { None };
             }
             if has_fill {
-                let mut fc = self.fill.unwrap_or(self.color);
-                if ui.color_edit_button_srgba(&mut fc.into()).changed() {
-                    self.fill = Some(fc);
+                let fill = self.fill.unwrap_or(self.color);
+                let mut fill_color =
+                    egui::Color32::from_rgba_unmultiplied(fill[0], fill[1], fill[2], fill[3]);
+                if ui.color_edit_button_srgba(&mut fill_color).changed() {
+                    self.fill = Some(fill_color.to_srgba_unmultiplied());
                 }
             }
 
@@ -879,18 +875,19 @@ impl EditorApp {
                     ui.label(format!("of {total}"));
                     let commit = re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if commit {
-                        if let Ok(n) = self.page_input.trim().parse::<usize>() {
-                            if n >= 1 && n <= total {
-                                self.go_to(n - 1);
-                            }
+                        if let Ok(n) = self.page_input.trim().parse::<usize>()
+                            && n >= 1
+                            && n <= total
+                        {
+                            self.go_to(n - 1);
                         }
                         self.page_input.clear();
                         re.request_focus();
                     }
-                    if !re.has_focus() {
-                        if self.page_input.is_empty() || self.page_input.parse::<usize>().is_ok() {
-                            self.page_input = (self.current_page + 1).to_string();
-                        }
+                    if !re.has_focus()
+                        && (self.page_input.is_empty() || self.page_input.parse::<usize>().is_ok())
+                    {
+                        self.page_input = (self.current_page + 1).to_string();
                     }
                 }
 
@@ -975,10 +972,13 @@ impl EditorApp {
                     let (page_rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
                     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                     if let Some((_, c)) = self.cache.iter().find(|(p, _)| *p == page) {
-                        ui.painter().rect_filled(page_rect.expand(1.0), 2.0, egui::Color32::WHITE);
-                        ui.painter().image(c.texture.id(), page_rect, uv, egui::Color32::WHITE);
+                        ui.painter()
+                            .rect_filled(page_rect.expand(1.0), 2.0, egui::Color32::WHITE);
+                        ui.painter()
+                            .image(c.texture.id(), page_rect, uv, egui::Color32::WHITE);
                     } else {
-                        ui.painter().rect_filled(page_rect, 2.0, egui::Color32::from_gray(70));
+                        ui.painter()
+                            .rect_filled(page_rect, 2.0, egui::Color32::from_gray(70));
                         if page_rect.intersects(ui.clip_rect()) {
                             let label = format!("{}", page + 1);
                             ui.painter().text(
@@ -1066,9 +1066,7 @@ impl EditorApp {
         selected: bool,
     ) {
         let painter = ui.painter();
-        let fill = |c: [u8; 4]| {
-            egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
-        };
+        let fill = |c: [u8; 4]| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
 
         match a.kind {
             AnnotationKind::Highlight => {
@@ -1084,12 +1082,17 @@ impl EditorApp {
                         rect,
                         0.0,
                         egui::Stroke::new((a.style.width * scale).max(0.5), fill(c)),
+                        egui::StrokeKind::Middle,
                     );
                 }
             }
             AnnotationKind::Ellipse => {
                 if let Some(c) = a.style.fill {
-                    painter.circle_filled(rect.center(), rect.width().min(rect.height()) / 2.0, fill(c));
+                    painter.circle_filled(
+                        rect.center(),
+                        rect.width().min(rect.height()) / 2.0,
+                        fill(c),
+                    );
                 }
                 if let Some(c) = a.style.stroke {
                     painter.circle_stroke(
@@ -1108,6 +1111,7 @@ impl EditorApp {
                         rect,
                         2.0,
                         egui::Stroke::new((a.style.width * scale).max(0.5), fill(c)),
+                        egui::StrokeKind::Middle,
                     );
                 }
                 let font = egui::FontId::proportional(a.font_size * scale);
@@ -1130,12 +1134,7 @@ impl EditorApp {
                     let pts: Vec<egui::Pos2> = a
                         .points
                         .iter()
-                        .map(|(x, y)| {
-                            egui::pos2(
-                                rect.min.x + x * scale,
-                                rect.max.y - y * scale,
-                            )
-                        })
+                        .map(|(x, y)| egui::pos2(rect.min.x + x * scale, rect.max.y - y * scale))
                         .collect();
                     painter.add(egui::Shape::line(
                         pts,
@@ -1150,6 +1149,7 @@ impl EditorApp {
                     rect,
                     0.0,
                     egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
+                    egui::StrokeKind::Middle,
                 );
             }
         }
@@ -1159,6 +1159,7 @@ impl EditorApp {
                 rect,
                 0.0,
                 egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 160, 255)),
+                egui::StrokeKind::Middle,
             );
             // Corner handles.
             for corner in ResizeCorner::all() {
@@ -1174,6 +1175,7 @@ impl EditorApp {
                     handle,
                     2.0,
                     egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 160, 255)),
+                    egui::StrokeKind::Middle,
                 );
             }
         }
@@ -1201,26 +1203,24 @@ impl EditorApp {
                 let _ = s;
                 self.paint_annotation(ui, &fake, rect, 1.0, false);
             }
-            Interaction::Inking { points, .. } => {
-                if points.len() >= 2 {
-                    let s = self.effective_scale(page);
-                    let pts: Vec<egui::Pos2> = points
-                        .iter()
-                        .map(|(x, y)| egui::pos2(page_rect.min.x + x * s, page_rect.max.y - y * s))
-                        .collect();
-                    painter.add(egui::Shape::line(
-                        pts,
-                        egui::Stroke::new(
-                            (self.stroke_width * s).max(0.5),
-                            egui::Color32::from_rgba_unmultiplied(
-                                self.color[0],
-                                self.color[1],
-                                self.color[2],
-                                self.color[3],
-                            ),
+            Interaction::Inking { page, points } if points.len() >= 2 => {
+                let s = self.effective_scale(*page);
+                let pts: Vec<egui::Pos2> = points
+                    .iter()
+                    .map(|(x, y)| egui::pos2(page_rect.min.x + x * s, page_rect.max.y - y * s))
+                    .collect();
+                painter.add(egui::Shape::line(
+                    pts,
+                    egui::Stroke::new(
+                        (self.stroke_width * s).max(0.5),
+                        egui::Color32::from_rgba_unmultiplied(
+                            self.color[0],
+                            self.color[1],
+                            self.color[2],
+                            self.color[3],
                         ),
-                    ));
-                }
+                    ),
+                ));
             }
             _ => {}
         }
@@ -1273,33 +1273,31 @@ impl EditorApp {
         };
 
         // Resize handles of the current selection take priority.
-        if let Some((sel_page, id)) = self.selected {
-            if sel_page == page {
-                if let Some(a) = doc.annotations[page].iter().find(|a| a.id == id).cloned() {
-                    let s = self.effective_scale(page);
-                    let (l, b, r, t) = a.bounds_f32();
-                    let rect = egui::Rect::from_min_max(
-                        egui::pos2(page_rect.min.x + l * s, page_rect.max.y - t * s),
-                        egui::pos2(page_rect.min.x + r * s, page_rect.max.y - b * s),
-                    );
-                    for corner in ResizeCorner::all() {
-                        let p = match corner {
-                            ResizeCorner::TopLeft => rect.left_top(),
-                            ResizeCorner::TopRight => rect.right_top(),
-                            ResizeCorner::BottomLeft => rect.left_bottom(),
-                            ResizeCorner::BottomRight => rect.right_bottom(),
-                        };
-                        let handle = egui::Rect::from_center_size(p, egui::vec2(14.0, 14.0));
-                        if handle.contains(pos) {
-                            self.interaction = Interaction::Resizing {
-                                page,
-                                id,
-                                corner,
-                                original: a.clone(),
-                            };
-                            return;
-                        }
-                    }
+        if let Some((sel_page, id)) = self.selected
+            && sel_page == page
+            && let Some(a) = doc.annotations[page].iter().find(|a| a.id == id).cloned()
+        {
+            let s = self.effective_scale(page);
+            let (l, b, r, t) = a.bounds_f32();
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(page_rect.min.x + l * s, page_rect.max.y - t * s),
+                egui::pos2(page_rect.min.x + r * s, page_rect.max.y - b * s),
+            );
+            for corner in ResizeCorner::all() {
+                let p = match corner {
+                    ResizeCorner::TopLeft => rect.left_top(),
+                    ResizeCorner::TopRight => rect.right_top(),
+                    ResizeCorner::BottomLeft => rect.left_bottom(),
+                    ResizeCorner::BottomRight => rect.right_bottom(),
+                };
+                let handle = egui::Rect::from_center_size(p, egui::vec2(14.0, 14.0));
+                if handle.contains(pos) {
+                    self.interaction = Interaction::Resizing {
+                        page,
+                        corner,
+                        original: a.clone(),
+                    };
+                    return;
                 }
             }
         }
@@ -1325,16 +1323,15 @@ impl EditorApp {
 
             self.selected = hit.map(|id| (page, id));
 
-            if let Some(id) = hit {
-                if let Some(a) = doc.annotations[page].iter().find(|a| a.id == id).cloned() {
-                    let (l, b, _, _) = a.bounds_f32();
-                    self.interaction = Interaction::Moving {
-                        page,
-                        id,
-                        grab_offset: (x - l, y - b),
-                        original: a,
-                    };
-                }
+            if let Some(id) = hit
+                && let Some(a) = doc.annotations[page].iter().find(|a| a.id == id).cloned()
+            {
+                let (l, b, _, _) = a.bounds_f32();
+                self.interaction = Interaction::Moving {
+                    page,
+                    grab_offset: (x - l, y - b),
+                    original: a,
+                };
             }
         }
     }
@@ -1402,7 +1399,7 @@ impl EditorApp {
 
     /// Advance any in-progress interaction using the current pointer state.
     fn update_interaction(&mut self, ctx: &egui::Context) {
-        let pointer = ctx.input(|i| i.pointer);
+        let pointer = ctx.input(|i| i.pointer.clone());
         let pos = pointer.interact_pos();
         let released = pointer.primary_released();
 
@@ -1477,7 +1474,6 @@ impl EditorApp {
             }
             Interaction::Moving {
                 page,
-                id,
                 grab_offset,
                 original,
             } => {
@@ -1501,8 +1497,11 @@ impl EditorApp {
                     if original.kind == AnnotationKind::Ink {
                         let dx = nl - l;
                         let dy = nb - b;
-                        updated.points =
-                            original.points.iter().map(|(px, py)| (px + dx, py + dy)).collect();
+                        updated.points = original
+                            .points
+                            .iter()
+                            .map(|(px, py)| (px + dx, py + dy))
+                            .collect();
                     }
                     if let Some(doc) = self.document.as_mut() {
                         let _ = doc.update_annotation(page, updated);
@@ -1515,7 +1514,6 @@ impl EditorApp {
             }
             Interaction::Resizing {
                 page,
-                id,
                 corner,
                 original,
             } => {
@@ -1556,9 +1554,7 @@ impl EditorApp {
 
     /// Which page (if any) contains the given screen position.
     fn page_at_screen_pos(&self, pos: egui::Pos2) -> Option<usize> {
-        self.page_rects
-            .iter()
-            .position(|rect| rect.contains(pos))
+        self.page_rects.iter().position(|rect| rect.contains(pos))
     }
 
     /// Screen rect of a page, from the last laid-out frame.
@@ -1567,7 +1563,9 @@ impl EditorApp {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let Some(doc) = self.document.as_ref() else { return };
+        let Some(doc) = self.document.as_ref() else {
+            return;
+        };
         let total = doc.page_count;
         let current = self.current_page;
         let aspects: Vec<f32> = (0..total)
@@ -1585,8 +1583,7 @@ impl EditorApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    for page in 0..total {
-                        let aspect = aspects[page];
+                    for (page, &aspect) in aspects.iter().enumerate().take(total) {
                         let thumb_w = (ui.available_width() - 8.0).min(150.0);
                         let size = egui::vec2(thumb_w, thumb_w / aspect);
 
@@ -1603,7 +1600,8 @@ impl EditorApp {
 
                         let inner = frame.show(ui, |ui| {
                             ui.vertical_centered(|ui| {
-                                if let Some((_, tex)) = self.thumbs.iter().find(|(p, _)| *p == page) {
+                                if let Some((_, tex)) = self.thumbs.iter().find(|(p, _)| *p == page)
+                                {
                                     let img = egui::Image::from_texture(tex)
                                         .max_size(size)
                                         .maintain_aspect_ratio(true);
@@ -1614,13 +1612,15 @@ impl EditorApp {
                                     ui.painter().rect_filled(
                                         rect,
                                         2.0,
-                                        egui::Color32::from_gray(if page == current { 90 } else { 55 }),
+                                        egui::Color32::from_gray(if page == current {
+                                            90
+                                        } else {
+                                            55
+                                        }),
                                     );
                                 }
                                 ui.label(
-                                    egui::RichText::new(format!("{}", page + 1))
-                                        .small()
-                                        .weak(),
+                                    egui::RichText::new(format!("{}", page + 1)).small().weak(),
                                 );
                             });
                         });
@@ -1641,14 +1641,16 @@ impl EditorApp {
 }
 
 impl eframe::App for EditorApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         self.poll_dialogs();
-        self.update_interaction(ctx);
+        self.update_interaction(&ctx);
 
         // Keyboard shortcuts.
         let typing = ctx.memory(|m| m.focused().is_some());
         if !typing {
-            if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+            if ctx
+                .input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
             {
                 self.delete_selected();
             }
@@ -1670,31 +1672,30 @@ impl eframe::App for EditorApp {
             }) {
                 self.go_to(self.current_page + 1);
             }
-            if ctx.input(|i| {
-                i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::PageUp)
-            }) {
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::PageUp))
+            {
                 self.go_to(self.current_page.saturating_sub(1));
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
                 self.go_to(0);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::End)) {
-                if let Some(d) = self.document.as_ref() {
-                    self.go_to(d.page_count.saturating_sub(1));
-                }
+            if ctx.input(|i| i.key_pressed(egui::Key::End))
+                && let Some(d) = self.document.as_ref()
+            {
+                self.go_to(d.page_count.saturating_sub(1));
             }
         }
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_bar(ui));
-        egui::TopBottomPanel::top("tools").show(ctx, |ui| self.tool_bar(ui));
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| self.bottom_bar(ui));
+        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::top("tools").show(ui, |ui| self.tool_bar(ui));
+        egui::Panel::bottom("bottom").show(ui, |ui| self.bottom_bar(ui));
         if self.show_thumbs && self.document.is_some() {
-            egui::SidePanel::left("thumbs")
+            egui::Panel::left("thumbs")
                 .resizable(true)
                 .default_size(180.0)
-                .show(ctx, |ui| self.sidebar(ui));
+                .show(ui, |ui| self.sidebar(ui));
         }
-        egui::CentralPanel::default().show(ctx, |ui| self.central_panel(ui));
+        egui::CentralPanel::default().show(ui, |ui| self.central_panel(ui));
 
         // Keep repainting while background work is running.
         let busy = !self.thumb_rendering.lock().unwrap().is_empty()
@@ -1702,7 +1703,71 @@ impl eframe::App for EditorApp {
             || !self.rendering.lock().unwrap().is_empty()
             || self.pending.lock().unwrap().is_some();
         if busy {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
+}
+
+/// Render one page as a small thumbnail, width-clamped to `target_w` pixels.
+fn render_thumbnail(
+    doc: &PdfDocument<'static>,
+    page_index: usize,
+    target_w: i32,
+) -> egui::ColorImage {
+    let blank = |w: i32, h: i32| {
+        egui::ColorImage::new(
+            [w.max(1) as usize, h.max(1) as usize],
+            vec![egui::Color32::from_gray(60); (w.max(1) * h.max(1)) as usize],
+        )
+    };
+
+    let Ok(page) = doc.pages().get(page_index as i32) else {
+        return blank(target_w, target_w);
+    };
+    let w_pts = page.width().value.max(1.0);
+    let h_pts = page.height().value.max(1.0);
+    let scale = (target_w as f32 / w_pts).clamp(0.05, 4.0);
+    let width = (w_pts * scale).max(1.0) as i32;
+    let height = (h_pts * scale).max(1.0) as i32;
+
+    let config = PdfRenderConfig::new()
+        .set_target_width(width)
+        .set_target_height(height)
+        .set_reverse_byte_order(true);
+
+    match page.render_with_config(&config) {
+        Ok(bitmap) => {
+            let rgba = bitmap.as_rgba_bytes();
+            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba)
+        }
+        Err(_) => blank(width, height),
+    }
+}
+
+/// Render one page into an RGBA image for the editor canvas.
+fn render_page(doc: &PdfDocument<'static>, page_index: usize, scale: f32) -> egui::ColorImage {
+    let placeholder = |w: f32, h: f32| {
+        let w = w.clamp(1.0, 4000.0) as usize;
+        let h = h.clamp(1.0, 4000.0) as usize;
+        egui::ColorImage::new([w, h], vec![egui::Color32::from_gray(200); w * h])
+    };
+
+    let Ok(page) = doc.pages().get(page_index as i32) else {
+        return placeholder(612.0 * scale, 792.0 * scale);
+    };
+    let width = (page.width().value * scale).max(1.0) as i32;
+    let height = (page.height().value * scale).max(1.0) as i32;
+
+    let config = PdfRenderConfig::new()
+        .set_target_width(width)
+        .set_target_height(height)
+        .set_reverse_byte_order(true);
+
+    let Ok(bitmap) = page.render_with_config(&config) else {
+        return placeholder(width as f32, height as f32);
+    };
+
+    let rgba = bitmap.as_rgba_bytes();
+    egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba)
 }
