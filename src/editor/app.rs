@@ -1316,7 +1316,8 @@ impl EditorApp {
         };
 
         // Resize handles of the current selection take priority.
-        if let Some((sel_page, id)) = self.selected
+        if response.drag_started()
+            && let Some((sel_page, id)) = self.selected
             && sel_page == page
             && let Some(a) = doc.annotations[page].iter().find(|a| a.id == id).cloned()
         {
@@ -1361,6 +1362,11 @@ impl EditorApp {
 
         if response.clicked() {
             self.selected = hit.map(|id| (page, id));
+            self.status = if hit.is_some() {
+                "Selected. Drag the center to move; drag a corner to resize.".into()
+            } else {
+                String::new()
+            };
             return;
         }
 
@@ -1575,11 +1581,52 @@ impl EditorApp {
                 {
                     let (x, y) = self.screen_to_pdf(page, pr, p);
                     let (l, b, r, t) = original.bounds_f32();
-                    let (mut nl, mut nb, mut nr, mut nt) = match corner {
-                        ResizeCorner::TopLeft => (x, y, r, t),
-                        ResizeCorner::TopRight => (l, y, x, t),
-                        ResizeCorner::BottomLeft => (x, b, r, y),
-                        ResizeCorner::BottomRight => (l, b, x, y),
+                    let (mut nl, mut nb, mut nr, mut nt) = if original.kind == AnnotationKind::Stamp
+                    {
+                        let original_width = (r - l).max(4.0);
+                        let original_height = (t - b).max(4.0);
+                        let (anchor_x, anchor_y, direction_x, direction_y) = match corner {
+                            ResizeCorner::TopLeft => (r, b, -1.0, 1.0),
+                            ResizeCorner::TopRight => (l, b, 1.0, 1.0),
+                            ResizeCorner::BottomLeft => (r, t, -1.0, -1.0),
+                            ResizeCorner::BottomRight => (l, t, 1.0, -1.0),
+                        };
+                        let requested_width = ((x - anchor_x) * direction_x).max(4.0);
+                        let requested_height = ((y - anchor_y) * direction_y).max(4.0);
+                        let scale = (requested_width / original_width)
+                            .max(requested_height / original_height)
+                            .max(4.0 / original_width)
+                            .max(4.0 / original_height);
+                        let width = original_width * scale;
+                        let height = original_height * scale;
+                        let left = if direction_x > 0.0 {
+                            anchor_x
+                        } else {
+                            anchor_x - width
+                        };
+                        let right = if direction_x > 0.0 {
+                            anchor_x + width
+                        } else {
+                            anchor_x
+                        };
+                        let bottom = if direction_y > 0.0 {
+                            anchor_y
+                        } else {
+                            anchor_y - height
+                        };
+                        let top = if direction_y > 0.0 {
+                            anchor_y + height
+                        } else {
+                            anchor_y
+                        };
+                        (left, bottom, right, top)
+                    } else {
+                        match corner {
+                            ResizeCorner::TopLeft => (x, y, r, t),
+                            ResizeCorner::TopRight => (l, y, x, t),
+                            ResizeCorner::BottomLeft => (x, b, r, y),
+                            ResizeCorner::BottomRight => (l, b, x, y),
+                        }
                     };
                     // Keep a minimum size so the annotation can't collapse.
                     if (nr - nl).abs() < 4.0 {
