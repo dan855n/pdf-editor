@@ -31,6 +31,24 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+### Universal macOS app
+
+Build a self-contained Universal app for both Apple Silicon and Intel Macs:
+
+```sh
+chmod +x packaging/build-universal-app.sh
+packaging/build-universal-app.sh
+```
+
+The resulting app and thumb-drive-ready ZIP are written to `dist/`. The app is
+ad-hoc signed but not notarized, so macOS may require the recipient to
+right-click the app and choose **Open** the first time.
+
+The package contains Universal executables for both `arm64` and `x86_64`, with
+a matching Universal PDFium library. It targets macOS 11 or newer. Both slices
+have been launched successfully; the Intel slice was tested through Rosetta 2
+on the build machine.
+
 ## Stage 4 (code complete — awaiting your manual test): search
 
 Adds to Stage 3:

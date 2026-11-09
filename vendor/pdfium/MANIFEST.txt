@@ -1,5 +1,6 @@
 pdfium_commit: 34cb5701b
 patch_branch:  master
-target:        mac arm64
-built_utc:     2026-09-20T07:07:49Z
-lib_sha256:    432c5180f779c32138c9772b45e20ae7272050263a5c9712e893576144b328b2
+target:        mac universal (x86_64 + arm64)
+source:        https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium%2F7763
+built_utc:     2026-03-30T08:00:20Z
+lib_sha256:    0286fffced83d3f03cdd6800c1e9451439a05110bde24c4ba57b7c9c218be923
