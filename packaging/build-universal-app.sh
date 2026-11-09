@@ -38,3 +38,42 @@ ditto -c -k --sequesterRsrc --keepParent \
 
 echo "Built $app_dir"
 echo "Built $dist_dir/PDF-Editor-macOS-universal.zip"
+
+build_arch_app() {
+    local label="$1"
+    local arch="$2"
+    local identifier="$3"
+    local zip_name="$4"
+    local arch_app="$dist_dir/PDF Editor ($label).app"
+    local arch_contents="$arch_app/Contents"
+    local arch_macos="$arch_contents/MacOS"
+
+    rm -rf "$arch_app"
+    mkdir -p "$arch_macos" "$arch_contents/Resources"
+    lipo -thin "$arch" "$macos_dir/pdf-editor" -output "$arch_macos/pdf-editor"
+    lipo -thin "$arch" "$macos_dir/libpdfium.dylib" -output "$arch_macos/libpdfium.dylib"
+    chmod +x "$arch_macos/pdf-editor"
+    cp "$project_dir/packaging/Info.plist" "$arch_contents/Info.plist"
+    cp "$project_dir/README.md" "$arch_contents/Resources/README.md"
+    plutil -replace CFBundleDisplayName -string "PDF Editor ($label)" \
+        "$arch_contents/Info.plist"
+    plutil -replace CFBundleName -string "PDF Editor ($label)" \
+        "$arch_contents/Info.plist"
+    plutil -replace CFBundleIdentifier -string "$identifier" \
+        "$arch_contents/Info.plist"
+
+    codesign --force --sign - "$arch_macos/libpdfium.dylib"
+    codesign --force --sign - "$arch_app"
+
+    rm -f "$dist_dir/$zip_name"
+    ditto -c -k --sequesterRsrc --keepParent "$arch_app" "$dist_dir/$zip_name"
+    echo "Built $arch_app"
+    echo "Built $dist_dir/$zip_name"
+}
+
+build_arch_app \
+    "Apple Silicon" arm64 local.danieledwards.pdf-editor.arm64 \
+    "PDF-Editor-Apple-Silicon.zip"
+build_arch_app \
+    "Intel" x86_64 local.danieledwards.pdf-editor.intel \
+    "PDF-Editor-Intel.zip"
