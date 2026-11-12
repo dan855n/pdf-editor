@@ -5,8 +5,15 @@
 
 pub mod annotations;
 pub mod document;
+pub mod engine;
+#[cfg(feature = "ocr")]
+pub mod ocr;
 pub mod pdfium_bindings;
+pub mod text_model;
 
 pub use annotations::{Annotation, AnnotationKind, StrokeStyle};
-pub use document::{DocumentError, OpenDocument, PageInfo, SaveOptions};
+pub use document::{DocumentError, OpenDocument, PageInfo};
+pub use engine::{SearchHit, display_size_pts, render_page, render_thumbnail, search_all_pages};
+#[cfg(feature = "ocr")]
+pub use ocr::{OcrWord, ocr_page_words, words_to_text};
 pub use pdfium_bindings::{library_dir, load_pdfium_bindings};

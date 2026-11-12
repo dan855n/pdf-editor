@@ -49,6 +49,22 @@ The resulting apps and thumb-drive-ready ZIPs are written to `dist/`. The apps
 are ad-hoc signed but not notarized, so macOS may require the recipient to
 right-click the app and choose **Open** the first time.
 
+The bundle includes an app icon (`packaging/AppIcon.icns`), registers PDF as a
+document type (so "Open With" lists PDF Editor), and stamps its version and
+build number into `Info.plist` from `Cargo.toml`.
+
+To produce a distributable, notarized build, sign with a Developer ID and
+notarize using a keychain profile:
+
+```sh
+CODESIGN_IDENTITY="Developer ID Application: Name (TEAMID)" \
+NOTARY_PROFILE="my-profile" packaging/build-universal-app.sh
+```
+
+Create the profile once with `xcrun notarytool store-credentials`. Without
+`CODESIGN_IDENTITY` the script falls back to ad-hoc signing, and without
+`NOTARY_PROFILE` it skips notarization.
+
 The package contains Universal executables for both `arm64` and `x86_64`, with
 a matching Universal PDFium library. It targets macOS 11 or newer. Both slices
 have been launched successfully; the Intel slice was tested through Rosetta 2
@@ -58,6 +74,33 @@ For macOS 28 compatibility on Apple Silicon, distribute
 `PDF-Editor-Apple-Silicon.zip`. The Universal package includes an Intel slice,
 and macOS may warn that this component will not run in macOS 28. Use
 `PDF-Editor-Intel.zip` for Intel Macs.
+
+> **Note:** the document association registers PDF Editor as a handler, but the
+> app does not yet respond to the macOS "open document" Apple event, so
+> double-clicking a PDF in Finder launches the editor without opening the file.
+> Opening via **File → Open** (⌘O) works normally. Receiving the file on launch
+> requires an `NSApplicationDelegate` (`objc2`) open-files handler.
+
+### OCR (make a scanned page searchable)
+
+The editor can recognize text in a scanned (image-only) page and add an
+invisible text layer so it becomes searchable, selectable, and copyable. The
+**🔍 OCR page** toolbar button recognizes the current page and opens an
+**OCR result** panel showing the recognized text — editable, with a **Copy**
+button.
+
+OCR is powered by the open-source [Tesseract](https://github.com/tesseract-ocr/tesseract)
+engine via the `leptess` crate, behind the `ocr` cargo feature:
+
+```sh
+brew install tesseract          # provides the library + eng.traineddata
+cargo run --features ocr --bin pdf-editor -- file.pdf
+```
+
+The build script enables OCR for the native (arm64) build only, because
+Tesseract's C library cannot be cross-compiled for x86_64 from an arm64 host.
+The Apple Silicon app bundles Tesseract/Leptonica and `eng.traineddata`; the
+Intel build has no OCR.
 
 ## Stage 4 (code complete — awaiting your manual test): search
 
@@ -126,10 +169,11 @@ cargo run -- path/to/file.pdf # opens directly
 
 ### How pdfium is loaded
 The prebuilt `libpdfium.dylib` lives in `vendor/pdfium/lib/` (from
-[docusealco/pdfium-binaries](https://github.com/docusealco/pdfium-binaries),
-commit 34cb5701b, 2026-09-20). The crate feature `pdfium_7763` matches that
-build's API level; if you swap the dylib for a newer one, bump the feature to
-match its release number.
+[bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries),
+build 8125 — `pdfium-mac-univ.tgz`, Chromium 158.0.8125.0). The crate feature
+`pdfium_8125` matches that build's API level; if you swap the dylib for a newer
+one, bump the feature to match its release number. The previous 7763 build is
+kept at `vendor/pdfium/lib/libpdfium.dylib.bak-7763` for rollback.
 
 ## Roadmap
 

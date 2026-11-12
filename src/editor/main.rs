@@ -5,6 +5,7 @@
 //! pdf-editor -- file.pdf`).
 
 mod app;
+mod persist;
 mod tools;
 mod undo;
 
@@ -31,7 +32,15 @@ pub fn main() -> eframe::Result {
         } else {
             eprintln!("no such file: {}", path.display());
         }
+    } else if let Some((last, page)) = persist::read_last_state() {
+        // Reopen the last document at the last page.
+        app.load_document(&last);
+        if page > 0 {
+            app.go_to(page);
+        }
     }
+
+    let saved_theme = persist::read_theme();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -44,7 +53,9 @@ pub fn main() -> eframe::Result {
         "pdf-editor",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            if let Some(theme) = saved_theme {
+                cc.egui_ctx.set_theme(theme);
+            }
             Ok(Box::new(app))
         }),
     )

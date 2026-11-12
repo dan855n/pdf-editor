@@ -11,6 +11,8 @@ pub enum Tool {
     Highlight,
     /// Freehand drawing.
     Ink,
+    /// Click to select and edit the original text in the PDF.
+    EditText,
     /// Drag a rectangle outline.
     Rectangle,
     /// Drag an ellipse outline.
@@ -19,17 +21,21 @@ pub enum Tool {
     Text,
     /// Click to place an image (signature, stamp, ...).
     Image,
+    /// Click an existing image in the PDF to select it.
+    ImageSelect,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 7] = [
+    pub const ALL: [Tool; 9] = [
         Tool::Select,
         Tool::Highlight,
         Tool::Ink,
+        Tool::EditText,
         Tool::Rectangle,
         Tool::Ellipse,
         Tool::Text,
         Tool::Image,
+        Tool::ImageSelect,
     ];
 
     pub fn label(self) -> &'static str {
@@ -37,10 +43,12 @@ impl Tool {
             Tool::Select => "Select",
             Tool::Highlight => "Highlight",
             Tool::Ink => "Ink",
+            Tool::EditText => "Edit text",
             Tool::Rectangle => "Rect",
             Tool::Ellipse => "Ellipse",
             Tool::Text => "Text",
             Tool::Image => "Image",
+            Tool::ImageSelect => "Img select",
         }
     }
 
@@ -49,10 +57,12 @@ impl Tool {
             Tool::Select => "⬚",
             Tool::Highlight => "🖍",
             Tool::Ink => "✏️",
+            Tool::EditText => "🔤",
             Tool::Rectangle => "▭",
             Tool::Ellipse => "◯",
             Tool::Text => "🅣",
             Tool::Image => "🖼",
+            Tool::ImageSelect => "🖼️🔍",
         }
     }
 
@@ -61,10 +71,12 @@ impl Tool {
             Tool::Select => None,
             Tool::Highlight => Some(AnnotationKind::Highlight),
             Tool::Ink => Some(AnnotationKind::Ink),
+            Tool::EditText => None,
             Tool::Rectangle => Some(AnnotationKind::Rectangle),
             Tool::Ellipse => Some(AnnotationKind::Ellipse),
             Tool::Text => Some(AnnotationKind::FreeText),
             Tool::Image => Some(AnnotationKind::Stamp),
+            Tool::ImageSelect => None,
         }
     }
 }

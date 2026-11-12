@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
 use eframe::egui;
-use pdf_viewer::load_pdfium_bindings;
+use pdf_viewer::{
+    SearchHit, display_size_pts, load_pdfium_bindings, render_page, render_thumbnail,
+    search_all_pages,
+};
 use pdfium_render::prelude::*;
 
 const GAP: f32 = 16.0; // gap between pages when scrolling
@@ -75,8 +78,8 @@ struct OpenDocument {
     path: PathBuf,
     page_count: usize,
     doc: Arc<PdfDocument<'static>>,
-    /// Page sizes in PDF points, index = page number.
-    sizes_pts: Vec<(f32, f32)>,
+    /// Page size and rotation in PDF points, index = page number.
+    sizes_pts: Vec<(f32, f32, PdfPageRenderRotation)>,
     title: String,
     author: String,
     producer: String,
@@ -94,9 +97,6 @@ fn meta(doc: &PdfDocument<'_>, tag: PdfDocumentMetadataTagType) -> String {
 
 /// A rendered page waiting to be uploaded to the GPU on the UI thread.
 type PendingTexture = Arc<Mutex<Option<(usize, f32, egui::ColorImage)>>>;
-
-/// One search hit: (page, left, bottom, right, top) in PDF points.
-type SearchHit = (usize, f32, f32, f32, f32);
 
 #[derive(Clone)]
 struct CachedPage {
@@ -243,7 +243,13 @@ impl PdfViewerApp {
                 let page_count = doc.pages().len().max(0) as usize;
                 let sizes_pts = (0..page_count)
                     .filter_map(|i| doc.pages().get(i as i32).ok())
-                    .map(|p| (p.width().value, p.height().value))
+                    .map(|p| {
+                        (
+                            p.width().value,
+                            p.height().value,
+                            p.rotation().unwrap_or(PdfPageRenderRotation::None),
+                        )
+                    })
                     .collect();
                 let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                 self.document = Some(OpenDocument {
@@ -280,7 +286,7 @@ impl PdfViewerApp {
             .document
             .as_ref()
             .and_then(|d| d.sizes_pts.get(page))
-            .map(|s| s.0)
+            .map(|&(w, h, rot)| display_size_pts(w, h, rot).0)
             .unwrap_or(612.0);
 
         if self.fit_width && self.last_available_width > 50.0 {
@@ -290,13 +296,13 @@ impl PdfViewerApp {
         }
     }
 
-    /// On-screen size of a page at the current scale.
+    /// On-screen size of a page at the current scale, honouring rotation.
     fn page_size_px(&self, page: usize) -> egui::Vec2 {
         let (w, h) = self
             .document
             .as_ref()
             .and_then(|d| d.sizes_pts.get(page))
-            .copied()
+            .map(|&(w, h, rot)| display_size_pts(w, h, rot))
             .unwrap_or((612.0, 792.0));
         let s = self.effective_scale(page);
         egui::vec2(w * s, h * s)
@@ -349,7 +355,7 @@ impl PdfViewerApp {
             }
 
             std::thread::spawn(move || {
-                let image = render_page(&doc_arc, page, scale);
+                let image = render_page(&doc_arc, page, scale, true);
                 // Spin until the previous result was consumed (small backlog
                 // is fine; renders are throttled anyway).
                 loop {
@@ -407,7 +413,7 @@ impl PdfViewerApp {
             self.thumb_rendering.lock().unwrap().push(page);
 
             std::thread::spawn(move || {
-                let image = render_thumbnail(&doc_arc, page, THUMB_W_PX);
+                let image = render_thumbnail(&doc_arc, page, THUMB_W_PX, true);
                 let mut slot = pending.lock().unwrap();
                 if !slot.iter().any(|(p, _)| *p == page) {
                     slot.push((page, image));
@@ -957,7 +963,11 @@ impl PdfViewerApp {
         let current = self.current_page;
         let aspects: Vec<f32> = (0..total)
             .map(|p| {
-                let (w, h) = doc.sizes_pts.get(p).copied().unwrap_or((612.0, 792.0));
+                let (w, h) = doc
+                    .sizes_pts
+                    .get(p)
+                    .map(|&(w, h, rot)| display_size_pts(w, h, rot))
+                    .unwrap_or((612.0, 792.0));
                 w / h
             })
             .collect();
@@ -1045,11 +1055,11 @@ impl PdfViewerApp {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let scale = self.effective_scale(self.current_page);
-                let (wpts, hpts) = doc
+                let (wpts, hpts, _) = doc
                     .sizes_pts
                     .get(self.current_page)
                     .copied()
-                    .unwrap_or((612.0, 792.0));
+                    .unwrap_or((612.0, 792.0, PdfPageRenderRotation::None));
                 ui.label(
                     egui::RichText::new(format!(
                         "{:.0}% · {:.0}×{:.0} pt",
@@ -1310,46 +1320,6 @@ fn save_last_position(page: usize) {
     }
 }
 
-/// Search every page's text layer for `query`, returning one bounding-box hit
-/// per occurrence. Runs off the UI thread; the `thread_safe` feature serializes
-/// pdfium access behind a mutex, so it's safe to run alongside page rendering.
-fn search_all_pages(doc: &PdfDocument<'static>, query: &str) -> Vec<SearchHit> {
-    let mut hits = Vec::new();
-    let options = PdfSearchOptions::new();
-    let page_count = doc.pages().len().max(0) as usize;
-
-    for p in 0..page_count {
-        let Ok(page) = doc.pages().get(p as i32) else {
-            continue;
-        };
-        let Ok(text) = page.text() else { continue };
-        let Ok(search) = text.search(query, &options) else {
-            continue;
-        };
-        for segments in search.iter(PdfSearchDirection::SearchForward) {
-            // Union of the segment rects that make up this hit.
-            let mut l = f32::MAX;
-            let mut b = f32::MAX;
-            let mut r = f32::MIN;
-            let mut t = f32::MIN;
-            for i in segments.as_range() {
-                if let Ok(seg) = segments.get(i) {
-                    let br = seg.bounds();
-                    l = l.min(br.left().value);
-                    b = b.min(br.bottom().value);
-                    r = r.max(br.right().value);
-                    t = t.max(br.top().value);
-                }
-            }
-            if l < r && b < t {
-                hits.push((p, l, b, r, t));
-            }
-        }
-    }
-
-    hits
-}
-
 fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64;
@@ -1365,69 +1335,3 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-/// Render one page as a small thumbnail, width-clamped to `target_w` pixels.
-fn render_thumbnail(
-    doc: &PdfDocument<'static>,
-    page_index: usize,
-    target_w: i32,
-) -> egui::ColorImage {
-    let blank = |w: i32, h: i32| {
-        egui::ColorImage::new(
-            [w.max(1) as usize, h.max(1) as usize],
-            vec![egui::Color32::from_gray(60); (w.max(1) * h.max(1)) as usize],
-        )
-    };
-
-    let Ok(page) = doc.pages().get(page_index as i32) else {
-        return blank(target_w, target_w);
-    };
-    let w_pts = page.width().value.max(1.0);
-    let h_pts = page.height().value.max(1.0);
-    let scale = (target_w as f32 / w_pts).clamp(0.05, 4.0);
-    let width = (w_pts * scale).max(1.0) as i32;
-    let height = (h_pts * scale).max(1.0) as i32;
-
-    let config = PdfRenderConfig::new()
-        .set_target_width(width)
-        .set_target_height(height)
-        .set_reverse_byte_order(true);
-
-    match page.render_with_config(&config) {
-        Ok(bitmap) => {
-            let rgba = bitmap.as_rgba_bytes();
-            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba)
-        }
-        Err(_) => blank(width, height),
-    }
-}
-
-// ------------------------------------------------------------------- render
-
-/// Render one page into an RGBA `ColorImage`. Runs off the UI thread; safe
-/// because `PdfDocument` is `Send + Sync` under pdfium-render's `thread_safe`
-/// feature and we hold it in an `Arc`.
-fn render_page(doc: &PdfDocument<'static>, page_index: usize, scale: f32) -> egui::ColorImage {
-    let placeholder = |w: f32, h: f32| {
-        let w = w.clamp(1.0, 4000.0) as usize;
-        let h = h.clamp(1.0, 4000.0) as usize;
-        egui::ColorImage::new([w, h], vec![egui::Color32::from_gray(200); w * h])
-    };
-
-    let Ok(page) = doc.pages().get(page_index as i32) else {
-        return placeholder(612.0 * scale, 792.0 * scale);
-    };
-    let width = (page.width().value * scale).max(1.0) as i32;
-    let height = (page.height().value * scale).max(1.0) as i32;
-
-    let config = PdfRenderConfig::new()
-        .set_target_width(width)
-        .set_target_height(height)
-        .set_reverse_byte_order(true);
-
-    let Ok(bitmap) = page.render_with_config(&config) else {
-        return placeholder(width as f32, height as f32);
-    };
-
-    let rgba = bitmap.as_rgba_bytes();
-    egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba)
-}

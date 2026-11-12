@@ -1,20 +1,108 @@
 //! Undo/redo for editor operations.
 //!
-//! The editor's document is a PDFium handle plus a plain-data annotation list,
-//! so undo is implemented as a snapshot of the annotation model: each step
-//! stores the full per-page annotation lists from before and after the
-//! operation. Restoring a snapshot re-applies the model to the PDF objects.
-//!
-//! Snapshots are small (a few KB for typical pages) and the stack is bounded,
-//! so a long editing session can't grow memory without limit.
+//! The editor's document is a PDFium handle plus plain-data models, so undo
+//! is implemented as snapshots of those models. Annotation operations store
+//! full per-page annotation lists; text edits store the before/after strings
+//! for a single line.
 
 use pdf_viewer::annotations::Annotation;
+use pdfium_render::prelude::{PdfMatrix, PdfPageTextRenderMode};
 
-/// One undoable step: the annotation model before and after the operation.
+/// One move-image edit. Undo/redo restores the object's exact matrix.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageMove {
+    pub page: usize,
+    pub object_index: usize,
+    pub before_matrix: PdfMatrix,
+    pub after_matrix: PdfMatrix,
+}
+
+/// One move-text edit. Undo/redo restores the text object's exact matrix.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextMove {
+    pub page: usize,
+    pub object_index: usize,
+    pub before_matrix: PdfMatrix,
+    pub after_matrix: PdfMatrix,
+}
+
+/// One restyle-text edit (font size + render mode). Undo/redo restores both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextStyle {
+    pub page: usize,
+    pub object_index: usize,
+    pub before_size: f32,
+    pub after_size: f32,
+    pub before_mode: PdfPageTextRenderMode,
+    pub after_mode: PdfPageTextRenderMode,
+}
+
+/// One rotate-image edit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageRotate {
+    pub page: usize,
+    pub object_index: usize,
+    /// Clockwise rotation applied by the original edit. Undo applies the
+    /// negative of this value; redo applies it again.
+    pub degrees_cw: f32,
+}
+
+/// One replace-image edit. The object matrix is unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageReplace {
+    pub page: usize,
+    pub object_index: usize,
+    pub before_bytes: Vec<u8>,
+    pub after_bytes: Vec<u8>,
+}
+
+/// One crop-image edit. Crop changes both the bitmap and the on-page matrix.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageCrop {
+    pub page: usize,
+    pub object_index: usize,
+    pub before_bytes: Vec<u8>,
+    pub before_matrix: PdfMatrix,
+    pub after_bytes: Vec<u8>,
+    pub after_matrix: PdfMatrix,
+}
+
+/// One original-text edit to a single visual line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextEdit {
+    pub page: usize,
+    pub run_index: usize,
+    /// The visual line text before and after the edit (UI model).
+    pub run_original: String,
+    pub run_new: String,
+    /// The full PDF text-object contents before and after the edit. These can
+    /// differ from the visual line by leading/trailing whitespace.
+    pub object_original: String,
+    pub object_new: String,
+    /// Index of the original PDF text object in the page's object collection.
+    pub object_index: usize,
+}
+
+/// One undoable document edit.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocumentEdit {
+    Annotations {
+        before: Vec<Vec<Annotation>>,
+        after: Vec<Vec<Annotation>>,
+    },
+    Text(TextEdit),
+    ImageMove(ImageMove),
+    TextMove(TextMove),
+    TextStyle(TextStyle),
+    ImageRotate(ImageRotate),
+    ImageReplace(ImageReplace),
+    ImageCrop(ImageCrop),
+}
+
+/// One undoable step: a label plus the edit itself.
 pub struct Step {
     pub label: String,
-    pub before: Vec<Vec<Annotation>>,
-    pub after: Vec<Vec<Annotation>>,
+    pub edit: DocumentEdit,
 }
 
 pub struct UndoStack {
@@ -39,19 +127,13 @@ impl UndoStack {
     }
 
     /// Record an operation.
-    pub fn push(
-        &mut self,
-        label: impl Into<String>,
-        before: Vec<Vec<Annotation>>,
-        after: Vec<Vec<Annotation>>,
-    ) {
+    pub fn push(&mut self, label: impl Into<String>, edit: DocumentEdit) {
         if self.past.len() >= self.limit {
             self.past.remove(0);
         }
         self.past.push(Step {
             label: label.into(),
-            before,
-            after,
+            edit,
         });
         self.future.clear();
     }
@@ -69,8 +151,7 @@ impl UndoStack {
         let step = self.past.pop()?;
         self.future.push(Step {
             label: step.label.clone(),
-            before: step.before.clone(),
-            after: step.after.clone(),
+            edit: step.edit.clone(),
         });
         Some(step)
     }
@@ -80,8 +161,7 @@ impl UndoStack {
         let step = self.future.pop()?;
         self.past.push(Step {
             label: step.label.clone(),
-            before: step.before.clone(),
-            after: step.after.clone(),
+            edit: step.edit.clone(),
         });
         Some(step)
     }

@@ -19,12 +19,20 @@ path = "src/editor/main.rs"
 [dependencies]
 eframe = "0.37"
 egui = "0.37"
-pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_7763", "thread_safe", "image_latest"] }
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_8125", "thread_safe", "image_latest"] }
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+leptess = { version = "0.14.0", optional = true }
+
+[features]
+# OCR (Tesseract) is optional because it links against a native C library that
+# cannot be cross-compiled for x86_64 from an arm64 host. Enable it for the
+# native (Apple Silicon) build only.
+ocr = ["dep:leptess"]
 
 # Keep the release binary lean; dev builds stay fast.
+# Note: stripping is done by packaging/build-universal-app.sh with the system
+# `strip`, since rust-objcopy is unreliable when libLLVM is unavailable.
 [profile.release]
 opt-level = 3
 lto = "thin"
-strip = true

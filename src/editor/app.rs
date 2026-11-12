@@ -6,16 +6,45 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use eframe::egui;
 use pdf_viewer::annotations::{Annotation, AnnotationKind, StrokeStyle};
-use pdf_viewer::{OpenDocument, SaveOptions};
+use pdf_viewer::text_model::TextRun;
+use pdf_viewer::{OpenDocument, SearchHit, render_page, render_thumbnail, search_all_pages};
 use pdfium_render::prelude::*;
 
 use crate::tools::{DragState, Interaction, ResizeCorner, Tool, annotation_from_drag};
-use crate::undo::UndoStack;
+use crate::undo::{
+    DocumentEdit, ImageCrop, ImageMove, ImageReplace, ImageRotate, TextEdit, TextMove, TextStyle,
+    UndoStack,
+};
+
+mod image_tools;
+mod search;
+mod ui;
 
 const GAP: f32 = 16.0;
 
 /// A rendered page waiting to be uploaded to the GPU on the UI thread.
 type PendingTexture = Arc<Mutex<Option<(usize, f32, egui::ColorImage)>>>;
+
+/// A pending "you have unsaved changes" confirmation.
+#[derive(Debug, Clone)]
+enum PendingConfirm {
+    /// The user asked to quit; confirm before discarding changes.
+    Close,
+    /// The user asked to open `PathBuf`; confirm before discarding changes.
+    Open(PathBuf),
+}
+
+/// In-progress original-text edit for a single visual line or word.
+struct TextEditState {
+    page: usize,
+    run_index: usize,
+    /// `Some` when editing a single word (index within the run); `None` for a
+    /// whole-line edit.
+    word_index: Option<usize>,
+    original: String,
+    buffer: String,
+    font_size: f32,
+}
 
 #[derive(Clone)]
 struct CachedPage {
@@ -38,12 +67,38 @@ pub struct EditorApp {
     cache: Vec<(usize, CachedPage)>,
 
     show_thumbs: bool,
+    show_help: bool,
+    /// Show the OCR-result preview panel.
+    show_page_text: bool,
+    /// Recognized text per page, keyed by page index (filled by OCR).
+    ocr_results: HashMap<usize, String>,
     thumb_pending: Arc<Mutex<Vec<(usize, egui::ColorImage)>>>,
     thumb_rendering: Arc<Mutex<Vec<usize>>>,
     thumbs: Vec<(usize, egui::TextureHandle)>,
     stamp_textures: HashMap<String, egui::TextureHandle>,
 
     page_input: String,
+
+    // ---- search ----
+    search_query: String,
+    search_hits: Vec<SearchHit>,
+    /// Index into search_hits of the currently selected hit.
+    search_selected: usize,
+    /// Set when we want the scroll strip to centre on the selected hit.
+    pending_hit_scroll: Option<usize>,
+    /// Set by ⌘F; the toolbar picks it up next frame to focus the field.
+    search_should_focus: bool,
+    search_field_id: Option<egui::Id>,
+    /// Last query actually run through pdfium, to avoid re-searching per frame.
+    last_searched: String,
+    /// Receiver for an in-flight background search, tagged with its generation.
+    search_rx: Option<mpsc::Receiver<(u64, Vec<SearchHit>)>>,
+    /// Incremented each new search so stale results are discarded.
+    search_gen: u64,
+    /// Debounced query waiting to run.
+    search_pending_query: Option<String>,
+    /// Earliest time the debounced query may run.
+    search_debounce_deadline: Option<std::time::Instant>,
 
     // ---- editing ----
     tool: Tool,
@@ -53,6 +108,44 @@ pub struct EditorApp {
     font_size: f32,
     interaction: Interaction,
     selected: Option<(usize, u64)>,
+    /// Cached original-text runs per page (Stage 1 text editing).
+    text_runs: Vec<Vec<TextRun>>,
+    text_runs_valid: Vec<bool>,
+    /// Currently selected original-text run: (page, run index).
+    selected_text_run: Option<(usize, usize)>,
+    /// Currently selected word within a run: (page, run index, word index).
+    selected_word: Option<(usize, usize, usize)>,
+    /// Original-text object being dragged: (page, object index).
+    text_drag: Option<(usize, usize)>,
+    /// Matrix of the dragged text object when the drag started, for move undo.
+    text_drag_start_matrix: Option<PdfMatrix>,
+    /// Accumulated drag offset in PDF points, for the live ghost preview.
+    text_drag_offset: (f32, f32),
+    /// Currently selected existing image: (page, object index).
+    selected_image: Option<(usize, usize)>,
+    /// Existing image being dragged: (page, object index).
+    image_drag: Option<(usize, usize)>,
+    /// Matrix of the dragged image when the drag started, for move undo.
+    image_drag_start_matrix: Option<PdfMatrix>,
+    /// Receiver for an in-flight image extraction save dialog.
+    image_extract_pending: Option<mpsc::Receiver<Option<PathBuf>>>,
+    /// Receiver for an in-flight image replacement open dialog: page, object
+    /// index, and the decoded bytes of the chosen file.
+    image_replace_pending: Option<mpsc::Receiver<Option<(usize, usize, Vec<u8>, Vec<u8>)>>>,
+    /// True while the user is dragging a crop rectangle over the selected image.
+    crop_mode: bool,
+    /// Start point of an in-progress crop drag: (page, object index, screen pos).
+    crop_start: Option<(usize, usize, egui::Pos2)>,
+    /// Current pointer position of an in-progress crop drag.
+    crop_current: Option<egui::Pos2>,
+    /// Dry-run original-text edits applied in the UI model (Phase 2).
+    text_edits: Vec<TextEdit>,
+    /// Active in-place edit state.
+    text_edit_state: Option<TextEditState>,
+    /// Screen rect where the in-place editor should be drawn.
+    text_edit_rect: Option<egui::Rect>,
+    /// Set when the in-place editor should request focus next frame.
+    text_edit_should_focus: bool,
     undo: UndoStack,
     dirty: bool,
     status: String,
@@ -70,6 +163,9 @@ pub struct EditorApp {
 
     /// Screen rects of the pages as laid out last frame, used for hit-testing.
     page_rects: Vec<egui::Rect>,
+
+    /// Pending unsaved-changes confirmation, if any.
+    confirm: Option<PendingConfirm>,
 }
 
 impl EditorApp {
@@ -86,11 +182,25 @@ impl EditorApp {
             rendering: Arc::new(Mutex::new(Vec::new())),
             cache: Vec::new(),
             show_thumbs: true,
+            show_help: false,
+            show_page_text: false,
+            ocr_results: HashMap::new(),
             thumb_pending: Arc::new(Mutex::new(Vec::new())),
             thumb_rendering: Arc::new(Mutex::new(Vec::new())),
             thumbs: Vec::new(),
             stamp_textures: HashMap::new(),
             page_input: String::new(),
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            search_selected: 0,
+            pending_hit_scroll: None,
+            search_should_focus: false,
+            search_field_id: None,
+            last_searched: String::new(),
+            search_rx: None,
+            search_gen: 0,
+            search_pending_query: None,
+            search_debounce_deadline: None,
             tool: Tool::Select,
             color: [230, 30, 30, 255],
             fill: None,
@@ -98,6 +208,25 @@ impl EditorApp {
             font_size: 14.0,
             interaction: Interaction::None,
             selected: None,
+            text_runs: Vec::new(),
+            text_runs_valid: Vec::new(),
+            selected_text_run: None,
+            selected_word: None,
+            text_drag: None,
+            text_drag_start_matrix: None,
+            text_drag_offset: (0.0, 0.0),
+            selected_image: None,
+            image_drag: None,
+            image_drag_start_matrix: None,
+            image_extract_pending: None,
+            image_replace_pending: None,
+            crop_mode: false,
+            crop_start: None,
+            crop_current: None,
+            text_edits: Vec::new(),
+            text_edit_state: None,
+            text_edit_rect: None,
+            text_edit_should_focus: false,
             undo: UndoStack::default(),
             dirty: false,
             status: "Ready".into(),
@@ -108,6 +237,7 @@ impl EditorApp {
             scroll_target: None,
             ignore_next_scroll: false,
             page_rects: Vec::new(),
+            confirm: None,
         }
     }
 
@@ -171,7 +301,12 @@ impl EditorApp {
         if let Some(result) = open_ready {
             self.open_pending = None;
             if let Some(path) = result {
-                self.load_document(&path);
+                if self.dirty {
+                    // Don't silently discard edits: ask first.
+                    self.confirm = Some(PendingConfirm::Open(path));
+                } else {
+                    self.load_document(&path);
+                }
             }
         }
 
@@ -206,6 +341,64 @@ impl EditorApp {
                 self.place_image(&path);
             }
         }
+
+        // Extract selected image
+        let mut doc_edited_after_replace = false;
+        let mut extract_ready = None;
+        if let Some(rx) = &self.image_extract_pending {
+            match rx.try_recv() {
+                Ok(v) => extract_ready = Some(v),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => extract_ready = Some(None),
+            }
+        }
+        if let Some(result) = extract_ready {
+            self.image_extract_pending = None;
+            if result.is_some() {
+                self.status = "Image extracted".into();
+            }
+        }
+
+        // Replace selected image
+        let mut replace_ready = None;
+        if let Some(rx) = &self.image_replace_pending {
+            match rx.try_recv() {
+                Ok(v) => replace_ready = Some(v),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => replace_ready = Some(None),
+            }
+        }
+        if let Some(result) = replace_ready {
+            self.image_replace_pending = None;
+            if let Some((page, object_index, before_bytes, after_bytes)) = result {
+                if let Some(doc) = self.document.as_mut()
+                    && let Err(e) =
+                        doc.replace_image_object_from_bytes(page, object_index, &after_bytes)
+                {
+                    self.error = Some(format!("Could not replace image: {e}"));
+                } else {
+                    self.undo.push(
+                        "Replace image",
+                        DocumentEdit::ImageReplace(ImageReplace {
+                            page,
+                            object_index,
+                            before_bytes,
+                            after_bytes,
+                        }),
+                    );
+                    doc_edited_after_replace = true;
+                    self.status = "Image replaced".into();
+                }
+            }
+        }
+        if doc_edited_after_replace {
+            if let Some(doc) = self.document.as_mut() {
+                doc.refresh_render_docs(self.pdfium);
+            }
+            self.cache.clear();
+            self.thumbs.clear();
+            self.dirty = true;
+        }
     }
 
     pub(crate) fn load_document(&mut self, path: &std::path::Path) {
@@ -222,10 +415,34 @@ impl EditorApp {
                 *self.pending.lock().unwrap() = None;
                 self.scroll_target = Some(0);
                 self.selected = None;
+                let page_count = self.document.as_ref().unwrap().page_count;
+                self.text_runs = vec![Vec::new(); page_count];
+                self.text_runs_valid = vec![false; page_count];
+                self.selected_text_run = None;
+                self.selected_word = None;
+                self.text_drag = None;
+                self.text_drag_start_matrix = None;
+                self.text_drag_offset = (0.0, 0.0);
+                self.selected_image = None;
+                self.image_drag = None;
+                self.image_drag_start_matrix = None;
+                self.image_extract_pending = None;
+                self.image_replace_pending = None;
+                self.crop_mode = false;
+                self.crop_start = None;
+                self.crop_current = None;
+                self.text_edits.clear();
+                self.text_edit_state = None;
+                self.text_edit_rect = None;
+                self.text_edit_should_focus = false;
                 self.interaction = Interaction::None;
                 self.undo.clear();
+                self.clear_search();
                 self.dirty = false;
                 self.status = "Document opened".into();
+                crate::persist::save_last_file(
+                    &path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+                );
             }
             Err(e) => {
                 self.error = Some(format!("Could not open {}: {e}", path.display()));
@@ -235,13 +452,35 @@ impl EditorApp {
 
     // ------------------------------------------------------------ geometry
 
-    fn effective_scale(&self, page: usize) -> f32 {
-        let page_w_pts = self
-            .document
+    /// Rotation of a page, defaulting to unrotated.
+    fn page_rotation(&self, page: usize) -> PdfPageRenderRotation {
+        self.document
             .as_ref()
             .and_then(|d| d.pages.get(page))
-            .map(|p| p.width_pts)
-            .unwrap_or(612.0);
+            .map(|p| p.rotation)
+            .unwrap_or(PdfPageRenderRotation::None)
+    }
+
+    /// Unrotated page dimensions in PDF points (width, height).
+    fn page_size_pts(&self, page: usize) -> (f32, f32) {
+        self.document
+            .as_ref()
+            .and_then(|d| d.pages.get(page))
+            .map(|p| (p.width_pts, p.height_pts))
+            .unwrap_or((612.0, 792.0))
+    }
+
+    /// On-screen (rotation-adjusted) page dimensions in PDF points.
+    fn page_display_pts(&self, page: usize) -> (f32, f32) {
+        let (w, h) = self.page_size_pts(page);
+        match self.page_rotation(page) {
+            PdfPageRenderRotation::Degrees90 | PdfPageRenderRotation::Degrees270 => (h, w),
+            _ => (w, h),
+        }
+    }
+
+    fn effective_scale(&self, page: usize) -> f32 {
+        let (page_w_pts, _) = self.page_display_pts(page);
 
         if self.fit_width && self.last_available_width > 50.0 {
             ((self.last_available_width - 48.0) / page_w_pts).clamp(0.2, 6.0)
@@ -251,30 +490,71 @@ impl EditorApp {
     }
 
     fn page_size_px(&self, page: usize) -> egui::Vec2 {
-        let (w, h) = self
-            .document
-            .as_ref()
-            .and_then(|d| d.pages.get(page))
-            .map(|p| (p.width_pts, p.height_pts))
-            .unwrap_or((612.0, 792.0));
+        let (w, h) = self.page_display_pts(page);
         let s = self.effective_scale(page);
         egui::vec2(w * s, h * s)
     }
 
-    /// Convert a screen point to PDF page coordinates for the given page rect.
-    fn screen_to_pdf(&self, page: usize, page_rect: egui::Rect, pos: egui::Pos2) -> (f32, f32) {
+    /// Convert a PDF page point (unrotated page space) to an absolute screen
+    /// position for the given laid-out page rectangle.
+    fn pdf_to_screen(&self, page: usize, page_rect: egui::Rect, x: f32, y: f32) -> egui::Pos2 {
+        let (pw, ph) = self.page_size_pts(page);
         let s = self.effective_scale(page);
-        let (w, _h) = self
-            .document
-            .as_ref()
-            .and_then(|d| d.pages.get(page))
-            .map(|p| (p.width_pts, p.height_pts))
-            .unwrap_or((612.0, 792.0));
-        // PDF y grows upward; screen y grows downward.
-        let x = (pos.x - page_rect.min.x) / s;
-        let y = (page_rect.max.y - pos.y) / s;
-        let _ = w;
-        (x, y)
+        let (sx, sy) = match self.page_rotation(page) {
+            PdfPageRenderRotation::Degrees90 => (y, x),
+            PdfPageRenderRotation::Degrees180 => (pw - x, ph - y),
+            PdfPageRenderRotation::Degrees270 => (ph - y, pw - x),
+            _ => (x, ph - y),
+        };
+        egui::pos2(page_rect.min.x + sx * s, page_rect.min.y + sy * s)
+    }
+
+    /// The four screen-space corners of an axis-aligned page-space rectangle,
+    /// in clockwise order starting from the bottom-left page-space corner.
+    fn page_rect_corners(
+        &self,
+        page: usize,
+        page_rect: egui::Rect,
+        l: f32,
+        b: f32,
+        r: f32,
+        t: f32,
+    ) -> [egui::Pos2; 4] {
+        [
+            self.pdf_to_screen(page, page_rect, l, b),
+            self.pdf_to_screen(page, page_rect, r, b),
+            self.pdf_to_screen(page, page_rect, r, t),
+            self.pdf_to_screen(page, page_rect, l, t),
+        ]
+    }
+
+    /// Axis-aligned screen bounding box of a page-space rectangle. Exact for
+    /// 0°/180° rotation; a conservative box for 90°/270°.
+    fn screen_bbox(
+        &self,
+        page: usize,
+        page_rect: egui::Rect,
+        l: f32,
+        b: f32,
+        r: f32,
+        t: f32,
+    ) -> egui::Rect {
+        egui::Rect::from_points(&self.page_rect_corners(page, page_rect, l, b, r, t))
+    }
+
+    /// Convert a screen point to PDF page coordinates (unrotated page space)
+    /// for the given page rect. This is the inverse of [`Self::pdf_to_screen`].
+    fn screen_to_pdf(&self, page: usize, page_rect: egui::Rect, pos: egui::Pos2) -> (f32, f32) {
+        let (pw, ph) = self.page_size_pts(page);
+        let s = self.effective_scale(page);
+        let sx = (pos.x - page_rect.min.x) / s;
+        let sy = (pos.y - page_rect.min.y) / s;
+        match self.page_rotation(page) {
+            PdfPageRenderRotation::Degrees90 => (sy, sx),
+            PdfPageRenderRotation::Degrees180 => (pw - sx, ph - sy),
+            PdfPageRenderRotation::Degrees270 => (pw - sy, ph - sx),
+            _ => (sx, ph - sy),
+        }
     }
 
     // ------------------------------------------------------------ rendering
@@ -298,13 +578,11 @@ impl EditorApp {
         let free =
             Self::MAX_CONCURRENT_RENDERS.saturating_sub(self.rendering.lock().unwrap().len());
         for page in queue.into_iter().take(free) {
-            let Some(scale) = self
-                .cached_scale(page)
-                .map(|_| ())
-                .map_or_else(|| Some(self.effective_scale(page)), |_| None)
-            else {
+            // A render may have landed in the cache since the queue was built.
+            if self.cached_scale(page).is_some() {
                 continue;
-            };
+            }
+            let scale = self.effective_scale(page);
             let Some(doc) = self.document.as_ref() else {
                 return;
             };
@@ -325,7 +603,7 @@ impl EditorApp {
             }
 
             std::thread::spawn(move || {
-                let image = render_page(&doc_arc, page, scale);
+                let image = render_page(&doc_arc, page, scale, false);
                 loop {
                     let mut slot = pending.lock().unwrap();
                     if slot.is_none() {
@@ -382,7 +660,7 @@ impl EditorApp {
             self.thumb_rendering.lock().unwrap().push(page);
 
             std::thread::spawn(move || {
-                let image = render_thumbnail(&doc_arc, page, THUMB_W_PX);
+                let image = render_thumbnail(&doc_arc, page, THUMB_W_PX, false);
                 let mut slot = pending.lock().unwrap();
                 if !slot.iter().any(|(p, _)| *p == page) {
                     slot.push((page, image));
@@ -480,17 +758,16 @@ impl EditorApp {
                 width: 0.0,
             },
             Tool::Image => StrokeStyle::default(),
-            Tool::Select => StrokeStyle::default(),
+            Tool::Select | Tool::EditText | Tool::ImageSelect => StrokeStyle::default(),
         }
     }
 
-    fn commit_annotation(&mut self, mut annotation: Annotation) {
+    fn commit_annotation(&mut self, page: usize, mut annotation: Annotation) {
         if annotation.kind == AnnotationKind::Highlight {
             annotation.style = StrokeStyle::highlight();
         }
         annotation.font_size = self.font_size;
 
-        let page = self.current_page;
         let Some(doc) = self.document.as_mut() else {
             return;
         };
@@ -502,8 +779,13 @@ impl EditorApp {
                 self.dirty = true;
                 self.selected = Some((page, id));
                 self.status = format!("{} added", annotation.kind.label());
-                self.undo
-                    .push("add annotation", before, doc.annotations.clone());
+                self.undo.push(
+                    "add annotation",
+                    DocumentEdit::Annotations {
+                        before,
+                        after: doc.annotations.clone(),
+                    },
+                );
             }
             Err(e) => {
                 self.error = Some(format!("Could not add annotation: {e}"));
@@ -529,55 +811,162 @@ impl EditorApp {
                 self.dirty = true;
                 self.selected = None;
                 self.status = "Annotation deleted".into();
-                self.undo
-                    .push("delete annotation", before, doc.annotations.clone());
+                self.undo.push(
+                    "delete annotation",
+                    DocumentEdit::Annotations {
+                        before,
+                        after: doc.annotations.clone(),
+                    },
+                );
                 let _ = annotation;
             }
             Err(e) => self.error = Some(format!("Could not delete annotation: {e}")),
         }
     }
 
+    /// The font size and stroke colour of the selected free-text annotation,
+    /// if one is selected.
+    fn selected_free_text(&self) -> Option<(f32, [u8; 4])> {
+        let (page, id) = self.selected?;
+        let doc = self.document.as_ref()?;
+        doc.annotations
+            .get(page)?
+            .iter()
+            .find(|a| a.id == id && a.kind == AnnotationKind::FreeText)
+            .map(|a| (a.font_size, a.style.stroke.unwrap_or([0, 0, 0, 255])))
+    }
+
+    /// Update the font size and colour of the selected free-text annotation.
+    fn edit_selected_text(&mut self, font_size: f32, color: [u8; 4]) {
+        let Some((page, id)) = self.selected else {
+            return;
+        };
+        let Some(doc) = self.document.as_mut() else {
+            return;
+        };
+        let Some(current) = doc.annotations[page]
+            .iter()
+            .find(|a| a.id == id && a.kind == AnnotationKind::FreeText)
+            .cloned()
+        else {
+            return;
+        };
+
+        let before = doc.annotations.clone();
+        let mut updated = current;
+        updated.font_size = font_size;
+        updated.style.stroke = Some(color);
+        if let Err(e) = doc.update_annotation(page, updated) {
+            self.error = Some(format!("Could not update text: {e}"));
+            return;
+        }
+        let after = doc.annotations.clone();
+        self.dirty = true;
+        self.undo
+            .push("edit text", DocumentEdit::Annotations { before, after });
+    }
+
+    /// The page, object index, font size, and render mode of the selected
+    /// original text (word or line), if the Edit Text tool has one selected.
+    fn selected_text_style(&self) -> Option<(usize, usize, f32, PdfPageTextRenderMode)> {
+        let (page, run_index) = self.selected_text_run?;
+        let run = self.text_runs.get(page)?.get(run_index)?;
+        let doc = self.document.as_ref()?;
+        let object_index = doc.text_object_index_for_run(page, run).ok()?;
+        let size = doc.text_object_font_size(page, object_index).ok()?;
+        let mode = doc.text_object_render_mode(page, object_index).ok()?;
+        Some((page, object_index, size, mode))
+    }
+
+    /// Restyle the selected original text (font size + render mode), undoable.
+    ///
+    /// Applies to the whole text object (typically one line), not a single word.
+    fn edit_selected_text_style(&mut self, size: f32, mode: PdfPageTextRenderMode) {
+        let Some((page, object_index, before_size, before_mode)) = self.selected_text_style()
+        else {
+            return;
+        };
+        let Some(doc) = self.document.as_mut() else {
+            return;
+        };
+        if let Err(e) = doc.set_text_object_font_size(page, object_index, size) {
+            self.error = Some(format!("Could not set text size: {e}"));
+            return;
+        }
+        if let Err(e) = doc.set_text_object_render_mode(page, object_index, mode) {
+            self.error = Some(format!("Could not set text style: {e}"));
+            return;
+        }
+        self.refresh_after_image_edit(page);
+        // The run's rendering changed, but the selection (indices) stays valid.
+        if let Some(valid) = self.text_runs_valid.get_mut(page) {
+            *valid = false;
+        }
+        self.dirty = true;
+        self.undo.push(
+            "restyle text",
+            DocumentEdit::TextStyle(TextStyle {
+                page,
+                object_index,
+                before_size,
+                after_size: size,
+                before_mode,
+                after_mode: mode,
+            }),
+        );
+    }
+
+
     /// Restore an annotation snapshot, re-applying it to the PDF objects.
+    ///
+    /// Failures are surfaced to the user instead of being silently ignored, so
+    /// a failed re-apply can never leave the model and the PDF silently out of
+    /// sync.
     fn restore_snapshot(&mut self, annotations: Vec<Vec<Annotation>>) {
         let Some(doc) = self.document.as_mut() else {
             return;
         };
 
-        // Remove every existing annotation from the PDF, then re-create the
-        // ones in the snapshot.
-        let page_count = doc.page_count;
-        for page in 0..page_count {
-            let Ok(mut pdf_page) = doc.doc.pages_mut().get(page as i32) else {
-                continue;
-            };
-            loop {
-                let annotations = pdf_page.annotations_mut();
-                if annotations.is_empty() {
-                    break;
-                }
-                let Ok(annotation) = annotations.get(0) else {
-                    break;
-                };
-                if annotations.delete_annotation(annotation).is_err() {
-                    break;
+        // Remove only the PDF objects backing the annotations the model
+        // currently tracks. This preserves foreign annotations (links, popups,
+        // text notes, ...) that the editor doesn't model.
+        let current = doc.annotations.clone();
+        for (page, list) in current.iter().enumerate() {
+            for a in list {
+                if let Err(e) = doc.remove_annotation_from_pdf(page, a) {
+                    self.error = Some(format!("Could not undo/redo: {e}"));
+                    return;
                 }
             }
         }
 
+        // Swap in the snapshot model, keeping ids stable, then rebuild the PDF
+        // objects it describes. No re-read: that would reassign ids.
         doc.annotations = annotations;
         let snapshot = doc.annotations.clone();
-        for page in 0..page_count {
-            let list = snapshot.get(page).cloned().unwrap_or_default();
+        for (page, list) in snapshot.iter().enumerate() {
             for a in list {
-                let _ = doc.apply_annotation_public(page, &a);
+                if let Err(e) = doc.apply_annotation_public(page, a) {
+                    self.error = Some(format!("Could not re-apply annotation: {e}"));
+                    return;
+                }
             }
         }
-        doc.read_annotations();
     }
 
     fn undo(&mut self) {
         if let Some(step) = self.undo.take_undo() {
-            self.restore_snapshot(step.before);
+            match step.edit {
+                DocumentEdit::Annotations { before, .. } => self.restore_snapshot(before),
+                DocumentEdit::Text(edit) => self.restore_text_edit(&edit, true),
+                DocumentEdit::ImageMove(edit) => self.restore_image_move(&edit, true),
+                DocumentEdit::TextMove(edit) => self.restore_text_move(&edit, true),
+                DocumentEdit::TextStyle(edit) => self.restore_text_style(&edit, true),
+                DocumentEdit::ImageRotate(edit) => self.restore_image_rotate(&edit, true),
+                DocumentEdit::ImageReplace(edit) => self.restore_image_replace(&edit, true),
+                DocumentEdit::ImageCrop(edit) => self.restore_image_crop(&edit, true),
+            }
+            self.selected = None;
             self.dirty = true;
             self.status = format!("Undid {}", step.label);
         }
@@ -585,17 +974,194 @@ impl EditorApp {
 
     fn redo(&mut self) {
         if let Some(step) = self.undo.take_redo() {
-            self.restore_snapshot(step.after);
+            match step.edit {
+                DocumentEdit::Annotations { after, .. } => self.restore_snapshot(after),
+                DocumentEdit::Text(edit) => self.restore_text_edit(&edit, false),
+                DocumentEdit::ImageMove(edit) => self.restore_image_move(&edit, false),
+                DocumentEdit::TextMove(edit) => self.restore_text_move(&edit, false),
+                DocumentEdit::TextStyle(edit) => self.restore_text_style(&edit, false),
+                DocumentEdit::ImageRotate(edit) => self.restore_image_rotate(&edit, false),
+                DocumentEdit::ImageReplace(edit) => self.restore_image_replace(&edit, false),
+                DocumentEdit::ImageCrop(edit) => self.restore_image_crop(&edit, false),
+            }
+            self.selected = None;
             self.dirty = true;
             self.status = format!("Redid {}", step.label);
         }
+    }
+
+    /// Write a text edit back into the PDF for undo/redo.
+    fn restore_text_edit(&mut self, edit: &TextEdit, to_original: bool) {
+        let run_text = if to_original {
+            edit.run_original.clone()
+        } else {
+            edit.run_new.clone()
+        };
+
+        let object_text = if to_original {
+            edit.object_original.clone()
+        } else {
+            edit.object_new.clone()
+        };
+
+        if let Some(doc) = self.document.as_mut()
+            && let Err(e) = doc.set_text_at_object_index(edit.page, edit.object_index, &object_text)
+        {
+            self.error = Some(format!("Could not restore text edit: {e}"));
+            return;
+        }
+
+        if let Some(doc) = self.document.as_mut() {
+            doc.refresh_render_docs(self.pdfium);
+        }
+
+        if let Some(run) = self
+            .text_runs
+            .get_mut(edit.page)
+            .and_then(|runs| runs.get_mut(edit.run_index))
+        {
+            run.text = run_text;
+        }
+        self.text_runs_valid[edit.page] = false;
+        self.text_edits.clear();
+        self.cache.retain(|(p, _)| *p != edit.page);
+        self.thumbs.retain(|(p, _)| *p != edit.page);
+        self.selected_text_run = None;
+        self.selected_word = None;
+    }
+
+    /// Undo/redo a move-image edit by restoring the before or after matrix.
+    fn restore_image_move(&mut self, edit: &ImageMove, to_original: bool) {
+        let matrix = if to_original {
+            edit.before_matrix
+        } else {
+            edit.after_matrix
+        };
+
+        if let Some(doc) = self.document.as_mut()
+            && let Err(e) = doc.set_image_object_matrix(edit.page, edit.object_index, matrix)
+        {
+            self.error = Some(format!("Could not restore image move: {e}"));
+            return;
+        }
+
+        self.refresh_after_image_edit(edit.page);
+    }
+
+    /// Undo/redo a move-text edit by restoring the before or after matrix.
+    fn restore_text_move(&mut self, edit: &TextMove, to_original: bool) {
+        let matrix = if to_original {
+            edit.before_matrix
+        } else {
+            edit.after_matrix
+        };
+
+        if let Some(doc) = self.document.as_mut()
+            && let Err(e) = doc.set_text_object_matrix(edit.page, edit.object_index, matrix)
+        {
+            self.error = Some(format!("Could not restore text move: {e}"));
+            return;
+        }
+
+        self.refresh_after_image_edit(edit.page);
+    }
+
+    /// Undo/redo a restyle-text edit by restoring font size and render mode.
+    fn restore_text_style(&mut self, edit: &TextStyle, to_original: bool) {
+        let size = if to_original {
+            edit.before_size
+        } else {
+            edit.after_size
+        };
+        let mode = if to_original {
+            edit.before_mode
+        } else {
+            edit.after_mode
+        };
+
+        if let Some(doc) = self.document.as_mut() {
+            if let Err(e) = doc.set_text_object_font_size(edit.page, edit.object_index, size) {
+                self.error = Some(format!("Could not restore text size: {e}"));
+                return;
+            }
+            if let Err(e) = doc.set_text_object_render_mode(edit.page, edit.object_index, mode) {
+                self.error = Some(format!("Could not restore text style: {e}"));
+                return;
+            }
+        }
+
+        self.refresh_after_image_edit(edit.page);
+        self.invalidate_text_runs();
+    }
+
+    /// Undo/redo a rotate-image edit by applying the opposite rotation.
+    fn restore_image_rotate(&mut self, edit: &ImageRotate, to_original: bool) {
+        let degrees = if to_original {
+            -edit.degrees_cw
+        } else {
+            edit.degrees_cw
+        };
+
+        if let Some(doc) = self.document.as_mut()
+            && let Err(e) = doc.rotate_image_object(edit.page, edit.object_index, degrees)
+        {
+            self.error = Some(format!("Could not restore image rotation: {e}"));
+            return;
+        }
+
+        self.refresh_after_image_edit(edit.page);
+    }
+
+    /// Undo/redo a replace-image edit by restoring the before or after bytes.
+    fn restore_image_replace(&mut self, edit: &ImageReplace, to_original: bool) {
+        let bytes = if to_original {
+            &edit.before_bytes
+        } else {
+            &edit.after_bytes
+        };
+
+        if let Some(doc) = self.document.as_mut()
+            && let Err(e) = doc.replace_image_object_from_bytes(edit.page, edit.object_index, bytes)
+        {
+            self.error = Some(format!("Could not restore image replacement: {e}"));
+            return;
+        }
+
+        self.refresh_after_image_edit(edit.page);
+    }
+
+    /// Undo/redo a crop-image edit by restoring both bitmap and matrix.
+    fn restore_image_crop(&mut self, edit: &ImageCrop, to_original: bool) {
+        let (bytes, matrix) = if to_original {
+            (&edit.before_bytes, edit.before_matrix)
+        } else {
+            (&edit.after_bytes, edit.after_matrix)
+        };
+
+        if let Some(doc) = self.document.as_mut()
+            && let Err(e) = doc.restore_image_object(edit.page, edit.object_index, bytes, matrix)
+        {
+            self.error = Some(format!("Could not restore image crop: {e}"));
+            return;
+        }
+
+        self.refresh_after_image_edit(edit.page);
+    }
+
+    /// Common cache refresh after an image-object undo/redo.
+    fn refresh_after_image_edit(&mut self, page: usize) {
+        if let Some(doc) = self.document.as_mut() {
+            doc.refresh_render_docs(self.pdfium);
+        }
+        self.cache.retain(|(p, _)| *p != page);
+        self.thumbs.retain(|(p, _)| *p != page);
     }
 
     fn save(&mut self) {
         let Some(doc) = self.document.as_mut() else {
             return;
         };
-        match doc.save(SaveOptions::default()) {
+        match doc.save() {
             Ok(()) => {
                 self.dirty = false;
                 self.status = format!("Saved {}", doc.path.display());
@@ -644,12 +1210,12 @@ impl EditorApp {
         let b = (ph - h) / 2.0;
         a.rect = PdfRect::new_from_values(b, l, b + h, l + w);
 
-        self.commit_annotation(a);
+        self.commit_annotation(self.current_page, a);
     }
 
     // ------------------------------------------------------------ actions
 
-    fn go_to(&mut self, page: usize) {
+    pub(crate) fn go_to(&mut self, page: usize) {
         let Some(doc) = self.document.as_ref() else {
             return;
         };
@@ -657,6 +1223,7 @@ impl EditorApp {
         self.current_page = page;
         self.scroll_target = Some(page);
         self.selected = None;
+        crate::persist::save_last_position(page);
     }
 
     fn zoom_in(&mut self) {
@@ -683,6 +1250,7 @@ impl EditorApp {
                 self.thumbs.clear();
                 self.selected = None;
                 self.scroll_target = Some(self.current_page);
+                self.invalidate_text_runs();
                 self.status = "Page deleted".into();
             }
             Err(e) => self.error = Some(format!("Could not delete page: {e}")),
@@ -700,6 +1268,7 @@ impl EditorApp {
                 self.cache.clear();
                 self.thumbs.clear();
                 self.scroll_target = Some(self.current_page);
+                self.invalidate_text_runs();
                 self.status = "Blank page inserted".into();
             }
             Err(e) => self.error = Some(format!("Could not insert page: {e}")),
@@ -715,243 +1284,64 @@ impl EditorApp {
                 self.dirty = true;
                 self.cache.clear();
                 self.thumbs.clear();
+                self.invalidate_text_runs();
                 self.status = "Page rotated 90°".into();
             }
             Err(e) => self.error = Some(format!("Could not rotate page: {e}")),
         }
     }
 
-    // ------------------------------------------------------------------ ui
-
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button(egui::RichText::new("📂 Open").strong()).clicked() {
-                self.open_dialog();
-            }
-            ui.label(egui::RichText::new("(⌘O)").weak());
-
-            ui.separator();
-
-            if ui.button("💾 Save").clicked() {
-                self.save();
-            }
-            if ui.button("Save As…").clicked() {
-                self.save_as_dialog();
-            }
-
-            ui.separator();
-
-            if ui
-                .add_enabled(self.undo.can_undo(), egui::Button::new("↩ Undo"))
-                .on_disabled_hover_text("Nothing to undo")
-                .on_hover_text(
-                    self.undo
-                        .next_undo_label()
-                        .map(|l| format!("Undo {l}"))
-                        .unwrap_or_default(),
-                )
-                .clicked()
-            {
-                self.undo();
-            }
-            if ui
-                .add_enabled(self.undo.can_redo(), egui::Button::new("↪ Redo"))
-                .on_disabled_hover_text("Nothing to redo")
-                .on_hover_text(
-                    self.undo
-                        .next_redo_label()
-                        .map(|l| format!("Redo {l}"))
-                        .unwrap_or_default(),
-                )
-                .clicked()
-            {
-                self.redo();
-            }
-
-            ui.separator();
-
-            if ui
-                .button("🗑 Delete annotation")
-                .on_hover_text("Delete the selected annotation (Delete key)")
-                .clicked()
-            {
-                self.delete_selected();
-            }
-
-            ui.separator();
-
-            match self.document.as_ref() {
-                Some(doc) => {
-                    let shown = if doc.title.is_empty() {
-                        doc.path
-                            .file_stem()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default()
-                    } else {
-                        doc.title.clone()
-                    };
-                    let suffix = if self.dirty { " *" } else { "" };
-                    ui.label(egui::RichText::new(format!("{shown}{suffix}")).strong());
-                }
-                None => {
-                    ui.label(egui::RichText::new("No document open").weak());
-                }
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !self.status.is_empty() {
-                    ui.label(egui::RichText::new(&self.status).weak().small());
-                    ui.separator();
-                }
-                if self.document.is_some() {
-                    let mut show = self.show_thumbs;
-                    if ui.toggle_value(&mut show, "Thumbnails").changed() {
-                        self.show_thumbs = show;
-                        self.request_thumbnails();
-                    }
-                }
-            });
-        });
-    }
-
-    fn tool_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Tool:");
-            for tool in Tool::ALL {
-                let text = format!("{} {}", tool.icon(), tool.label());
-                if ui.selectable_label(self.tool == tool, text).clicked() {
-                    self.tool = tool;
-                    self.interaction = Interaction::None;
-                    self.selected = None;
-                    if self.tool == Tool::Image {
-                        self.image_dialog();
-                    }
-                }
-            }
-
-            ui.separator();
-
-            ui.label("Text:");
-            ui.add_sized(
-                [140.0, ui.spacing().interact_size.y],
-                egui::TextEdit::singleline(&mut self.text_buffer)
-                    .hint_text("note text…")
-                    .desired_width(140.0),
+    /// OCR the current page and add an invisible text layer, making a scanned
+    /// page searchable/selectable without changing its appearance.
+    #[cfg(feature = "ocr")]
+    fn ocr_page(&mut self) {
+        let Some(tessdata) = tessdata_dir() else {
+            self.error = Some(
+                "Tesseract language data (eng.traineddata) not found".into(),
             );
+            return;
+        };
+        let page = self.current_page;
 
-            ui.separator();
-
-            ui.label("Colour:");
-            let mut color = egui::Color32::from_rgba_unmultiplied(
-                self.color[0],
-                self.color[1],
-                self.color[2],
-                self.color[3],
-            );
-            if ui.color_edit_button_srgba(&mut color).changed() {
-                self.color = color.to_srgba_unmultiplied();
-            }
-
-            ui.separator();
-
-            ui.label("Fill:");
-            let mut has_fill = self.fill.is_some();
-            if ui.checkbox(&mut has_fill, "").changed() {
-                self.fill = if has_fill { Some(self.color) } else { None };
-            }
-            if has_fill {
-                let fill = self.fill.unwrap_or(self.color);
-                let mut fill_color =
-                    egui::Color32::from_rgba_unmultiplied(fill[0], fill[1], fill[2], fill[3]);
-                if ui.color_edit_button_srgba(&mut fill_color).changed() {
-                    self.fill = Some(fill_color.to_srgba_unmultiplied());
+        let words = {
+            let Some(doc) = self.document.as_ref() else {
+                return;
+            };
+            match pdf_viewer::ocr_page_words(doc, page, &tessdata, "eng") {
+                Ok(w) => w,
+                Err(e) => {
+                    self.error = Some(format!("OCR failed: {e}"));
+                    return;
                 }
             }
+        };
 
-            ui.separator();
+        if words.is_empty() {
+            self.status = "OCR found no text on this page".into();
+            return;
+        }
+        let n = words.len();
 
-            ui.label("Width:");
-            ui.add(egui::Slider::new(&mut self.stroke_width, 0.5..=12.0).step_by(0.5));
+        // Keep the recognized text for the preview panel.
+        self.ocr_results.insert(page, pdf_viewer::words_to_text(&words));
+        self.show_page_text = true;
 
-            ui.separator();
+        let Some(doc) = self.document.as_mut() else {
+            return;
+        };
+        if let Err(e) = doc.add_invisible_text_layer(page, &words) {
+            self.error = Some(format!("Could not add text layer: {e}"));
+            return;
+        }
+        doc.refresh_render_docs(self.pdfium);
 
-            ui.label("Font:");
-            ui.add(egui::Slider::new(&mut self.font_size, 6.0..=72.0).step_by(1.0));
-
-            ui.separator();
-
-            if ui.button("🗑 Delete page").clicked() {
-                self.delete_page();
-            }
-            if ui.button("➕ Insert page").clicked() {
-                self.insert_page();
-            }
-            if ui.button("⟳ Rotate page").clicked() {
-                self.rotate_page();
-            }
-        });
+        self.invalidate_text_runs();
+        self.cache.retain(|(p, _)| *p != page);
+        self.thumbs.retain(|(p, _)| *p != page);
+        self.dirty = true;
+        self.status = format!("OCR added {n} words to page {}", page + 1);
     }
 
-    fn bottom_bar(&mut self, ui: &mut egui::Ui) {
-        let total = self.document.as_ref().map(|d| d.page_count).unwrap_or(0);
-
-        ui.add_enabled_ui(total > 0, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("◀ Prev").clicked() {
-                    self.go_to(self.current_page.saturating_sub(1));
-                }
-
-                if total > 0 {
-                    ui.label("Page");
-                    let re = ui.add_sized(
-                        [56.0, ui.spacing().interact_size.y],
-                        egui::TextEdit::singleline(&mut self.page_input)
-                            .hint_text(egui::RichText::new("go to…").weak())
-                            .align(egui::Align2::LEFT_CENTER)
-                            .desired_width(56.0),
-                    );
-                    ui.label(format!("of {total}"));
-                    let commit = re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if commit {
-                        if let Ok(n) = self.page_input.trim().parse::<usize>()
-                            && n >= 1
-                            && n <= total
-                        {
-                            self.go_to(n - 1);
-                        }
-                        self.page_input.clear();
-                        re.request_focus();
-                    }
-                    if !re.has_focus()
-                        && (self.page_input.is_empty() || self.page_input.parse::<usize>().is_ok())
-                    {
-                        self.page_input = (self.current_page + 1).to_string();
-                    }
-                }
-
-                if ui.button("Next ▶").clicked() {
-                    self.go_to(self.current_page + 1);
-                }
-
-                ui.separator();
-
-                if ui.button("➖").clicked() {
-                    self.zoom_out();
-                }
-                let pct = self.effective_scale(self.current_page) * 100.0;
-                ui.monospace(format!("{:>4.0}%", pct));
-                if ui.button("➕").clicked() {
-                    self.zoom_in();
-                }
-
-                ui.separator();
-
-                if ui.toggle_value(&mut self.fit_width, "Fit width").changed() {
-                    self.request_fit_rebuild();
-                }
-            });
-        });
-    }
 
     fn central_panel(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_rect_before_wrap();
@@ -1004,6 +1394,9 @@ impl EditorApp {
             self.ignore_next_scroll = true;
         }
 
+        // Take the pending hit-scroll target before the closure borrows `self`.
+        let hit_scroll_target = self.pending_hit_scroll.take();
+
         let out = sa.show(ui, |ui| {
             let mut laid_out: Vec<egui::Rect> = Vec::with_capacity(total);
             ui.vertical_centered(|ui| {
@@ -1032,18 +1425,197 @@ impl EditorApp {
                         }
                     }
 
+                    // ---- dry-run original-text edits ----
+                    for (run_index, run) in
+                        self.text_runs.get(page).into_iter().flatten().enumerate()
+                    {
+                        if let Some(edit) = self
+                            .text_edits
+                            .iter()
+                            .find(|e| e.page == page && e.run_index == run_index)
+                        {
+                            let s = self.effective_scale(page);
+                            let rect = self.screen_bbox(
+                                page, page_rect, run.left, run.bottom, run.right, run.top,
+                            );
+                            let painter = ui.painter();
+                            painter.rect_filled(rect.expand(2.0), 0.0, egui::Color32::WHITE);
+                            let base = self.pdf_to_screen(page, page_rect, run.left, run.baseline_y);
+                            painter.text(
+                                base,
+                                egui::Align2::LEFT_BOTTOM,
+                                &edit.run_new,
+                                egui::FontId::proportional(run.font_size * s),
+                                egui::Color32::BLACK,
+                            );
+                            painter.line_segment(
+                                [
+                                    rect.left_bottom() + egui::vec2(0.0, 1.0),
+                                    rect.right_bottom() + egui::vec2(0.0, 1.0),
+                                ],
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 170, 255)),
+                            );
+                        }
+                    }
+
                     // ---- existing annotations ----
                     if let Some(doc) = self.document.as_ref() {
-                        let s = self.effective_scale(page);
                         for a in &doc.annotations[page] {
-                            let (l, b, r, t) = a.bounds_f32();
-                            let rect = egui::Rect::from_min_max(
-                                egui::pos2(page_rect.min.x + l * s, page_rect.max.y - t * s),
-                                egui::pos2(page_rect.min.x + r * s, page_rect.max.y - b * s),
-                            );
                             let is_selected = self.selected == Some((page, a.id));
-                            self.paint_annotation(ui, a, rect, s, is_selected);
+                            self.paint_annotation(ui, a, page, page_rect, is_selected);
                         }
+                    }
+
+                    // ---- search highlights (in content space) ----
+                    let selected = self.search_selected;
+                    for (i, hit) in self.search_hits.iter().enumerate() {
+                        if hit.0 != page {
+                            continue;
+                        }
+                        let (_pg, l, b, r_, t) = *hit;
+                        let rect = self.screen_bbox(page, page_rect, l, b, r_, t);
+                        let fill = if i == selected {
+                            egui::Color32::from_rgba_unmultiplied(255, 214, 0, 160)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(255, 214, 0, 70)
+                        };
+                        ui.painter().rect_filled(rect.expand(1.0), 1.0, fill);
+                    }
+
+                    // ---- selected word highlight ----
+                    if let Some((sel_page, run_index, word_index)) = self.selected_word
+                        && sel_page == page
+                        && let Some(run) = self.text_runs.get(page).and_then(|r| r.get(run_index))
+                        && let Some(word) = run.words.get(word_index)
+                    {
+                        let rect = self.screen_bbox(
+                            page, page_rect, word.left, word.bottom, word.right, word.top,
+                        );
+                        ui.painter().rect_filled(
+                            rect.expand(1.0),
+                            2.0,
+                            egui::Color32::from_rgba_unmultiplied(90, 170, 255, 60),
+                        );
+                        ui.painter().rect_stroke(
+                            rect.expand(2.0),
+                            2.0,
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 170, 255)),
+                            egui::StrokeKind::Middle,
+                        );
+                    }
+
+                    // ---- selected original-text run ----
+                    if let Some((sel_page, run_index)) = self.selected_text_run
+                        && sel_page == page
+                        && let Some(run) = self.text_runs.get(page).and_then(|r| r.get(run_index))
+                    {
+                        let rect = self.screen_bbox(
+                            page, page_rect, run.left, run.bottom, run.right, run.top,
+                        );
+                        ui.painter().rect_stroke(
+                            rect.expand(2.0),
+                            2.0,
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 170, 255)),
+                            egui::StrokeKind::Middle,
+                        );
+
+                        if let Some(state) = &self.text_edit_state
+                            && state.page == page
+                            && state.run_index == run_index
+                        {
+                            let edit_rect = if let Some(word_index) = state.word_index
+                                && let Some(word) = run.words.get(word_index)
+                            {
+                                self.screen_bbox(
+                                    page,
+                                    page_rect,
+                                    word.left,
+                                    word.bottom,
+                                    word.right,
+                                    word.top,
+                                )
+                            } else {
+                                rect
+                            };
+                            self.text_edit_rect = Some(edit_rect.expand(2.0));
+                        }
+                    }
+
+                    // ---- text-drag ghost preview ----
+                    if let Some((drag_page, _)) = self.text_drag
+                        && drag_page == page
+                        && let Some((_, run_index)) = self.selected_text_run
+                        && let Some(run) = self.text_runs.get(page).and_then(|r| r.get(run_index))
+                    {
+                        let s = self.effective_scale(page);
+                        let (ox, oy) = self.text_drag_offset;
+                        let rect = self.screen_bbox(
+                            page,
+                            page_rect,
+                            run.left + ox,
+                            run.bottom + oy,
+                            run.right + ox,
+                            run.top + oy,
+                        );
+                        ui.painter().rect_filled(
+                            rect.expand(1.0),
+                            2.0,
+                            egui::Color32::from_rgba_unmultiplied(90, 170, 255, 40),
+                        );
+                        ui.painter().rect_stroke(
+                            rect.expand(2.0),
+                            2.0,
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 170, 255)),
+                            egui::StrokeKind::Middle,
+                        );
+                        let top_left =
+                            self.pdf_to_screen(page, page_rect, run.left + ox, run.top + oy);
+                        ui.painter().text(
+                            top_left,
+                            egui::Align2::LEFT_TOP,
+                            &run.text,
+                            egui::FontId::proportional(run.font_size * s),
+                            egui::Color32::from_rgba_unmultiplied(60, 120, 220, 160),
+                        );
+                    }
+
+                    // ---- selected existing image ----
+                    if let Some((sel_page, image_index)) = self.selected_image
+                        && sel_page == page
+                        && let Some(doc) = self.document.as_ref()
+                        && let Ok(pdf_page) = doc.doc.pages().get(page as i32)
+                        && let Ok(object) = pdf_page.objects().get(image_index)
+                        && let Some(image) = object.as_image_object()
+                        && let Ok(bounds) = image.bounds()
+                    {
+                        let rect = self.screen_bbox(
+                            page,
+                            page_rect,
+                            bounds.left().value,
+                            bounds.bottom().value,
+                            bounds.right().value,
+                            bounds.top().value,
+                        );
+                        ui.painter().rect_stroke(
+                            rect.expand(2.0),
+                            2.0,
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 170, 255)),
+                            egui::StrokeKind::Middle,
+                        );
+                    }
+
+                    // ---- in-progress crop rectangle ----
+                    if self.crop_mode
+                        && let Some((crop_page, _, start)) = self.crop_start
+                        && crop_page == page
+                    {
+                        let end = self.crop_current.unwrap_or(start);
+                        ui.painter().rect_stroke(
+                            egui::Rect::from_two_pos(start, end),
+                            2.0,
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 200, 60)),
+                            egui::StrokeKind::Middle,
+                        );
                     }
 
                     // ---- in-progress drawing ----
@@ -1056,11 +1628,26 @@ impl EditorApp {
                     ui.add_space(GAP);
                 }
             });
+
+            // Scroll to the selected search hit.
+            if let Some(idx) = hit_scroll_target
+                && let Some(&(p, l, b, r_, t)) = self.search_hits.get(idx)
+                && let Some(pr) = laid_out.get(p)
+            {
+                let hit_center = self.pdf_to_screen(p, *pr, (l + r_) / 2.0, (b + t) / 2.0);
+                ui.scroll_to_rect(
+                    egui::Rect::from_min_size(hit_center, egui::vec2(1.0, 1.0)),
+                    Some(egui::Align::Center),
+                );
+            }
+
             // Return the laid-out rects through the scroll area's output.
             laid_out
         });
 
         self.page_rects = out.inner;
+
+        self.show_text_edit_overlay(ui);
 
         let top_y = out.state.clamped_offset().y;
         let mut page = total.saturating_sub(1);
@@ -1097,67 +1684,81 @@ impl EditorApp {
         self.evict_cache(&keep);
     }
 
-    /// Paint one annotation onto the page.
+    /// Paint one annotation onto the page, honouring page rotation.
     fn paint_annotation(
         &self,
         ui: &egui::Ui,
         a: &Annotation,
-        rect: egui::Rect,
-        scale: f32,
+        page: usize,
+        page_rect: egui::Rect,
         selected: bool,
     ) {
         let painter = ui.painter();
         let fill = |c: [u8; 4]| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+        let (l, b, r, t) = a.bounds_f32();
+        let scale = self.effective_scale(page);
+        let corners = self.page_rect_corners(page, page_rect, l, b, r, t);
 
         match a.kind {
             AnnotationKind::Highlight => {
                 let c = a.style.fill.unwrap_or([255, 220, 0, 110]);
-                painter.rect_filled(rect, 0.0, fill(c));
+                painter.add(egui::Shape::convex_polygon(
+                    corners.to_vec(),
+                    fill(c),
+                    egui::Stroke::NONE,
+                ));
             }
             AnnotationKind::Rectangle => {
                 if let Some(c) = a.style.fill {
-                    painter.rect_filled(rect, 0.0, fill(c));
+                    painter.add(egui::Shape::convex_polygon(
+                        corners.to_vec(),
+                        fill(c),
+                        egui::Stroke::NONE,
+                    ));
                 }
                 if let Some(c) = a.style.stroke {
-                    painter.rect_stroke(
-                        rect,
-                        0.0,
+                    painter.add(egui::Shape::closed_line(
+                        corners.to_vec(),
                         egui::Stroke::new((a.style.width * scale).max(0.5), fill(c)),
-                        egui::StrokeKind::Middle,
-                    );
+                    ));
                 }
             }
             AnnotationKind::Ellipse => {
+                let pts = ellipse_pts(self, page, page_rect, l, b, r, t);
                 if let Some(c) = a.style.fill {
-                    painter.circle_filled(
-                        rect.center(),
-                        rect.width().min(rect.height()) / 2.0,
+                    painter.add(egui::Shape::convex_polygon(
+                        pts.clone(),
                         fill(c),
-                    );
+                        egui::Stroke::NONE,
+                    ));
                 }
                 if let Some(c) = a.style.stroke {
-                    painter.circle_stroke(
-                        rect.center(),
-                        rect.width().min(rect.height()) / 2.0,
+                    painter.add(egui::Shape::closed_line(
+                        pts,
                         egui::Stroke::new((a.style.width * scale).max(0.5), fill(c)),
-                    );
+                    ));
                 }
             }
             AnnotationKind::FreeText => {
                 if let Some(c) = a.style.fill {
-                    painter.rect_filled(rect, 2.0, fill(c));
+                    painter.add(egui::Shape::convex_polygon(
+                        corners.to_vec(),
+                        fill(c),
+                        egui::Stroke::NONE,
+                    ));
                 }
                 if let Some(c) = a.style.stroke {
-                    painter.rect_stroke(
-                        rect,
-                        2.0,
+                    painter.add(egui::Shape::closed_line(
+                        corners.to_vec(),
                         egui::Stroke::new((a.style.width * scale).max(0.5), fill(c)),
-                        egui::StrokeKind::Middle,
-                    );
+                    ));
                 }
+                // Text glyphs stay horizontal (egui cannot rotate text); anchor
+                // them at the mapped top-left corner of the annotation.
+                let top_left = self.pdf_to_screen(page, page_rect, l, t);
                 let font = egui::FontId::proportional(a.font_size * scale);
                 painter.text(
-                    rect.left_top(),
+                    top_left,
                     egui::Align2::LEFT_TOP,
                     &a.text,
                     font,
@@ -1175,7 +1776,7 @@ impl EditorApp {
                     let pts: Vec<egui::Pos2> = a
                         .points
                         .iter()
-                        .map(|(x, y)| egui::pos2(rect.min.x + x * scale, rect.max.y - y * scale))
+                        .map(|(x, y)| self.pdf_to_screen(page, page_rect, *x, *y))
                         .collect();
                     painter.add(egui::Shape::line(
                         pts,
@@ -1187,6 +1788,9 @@ impl EditorApp {
                 if let Some(path) = a.image_path.as_ref()
                     && let Some(texture) = self.stamp_textures.get(path)
                 {
+                    // Images cannot be drawn as rotated quads, so use the mapped
+                    // bounding box (exact for 0°/180°, approximate for 90°/270°).
+                    let rect = self.screen_bbox(page, page_rect, l, b, r, t);
                     painter.image(
                         texture.id(),
                         rect,
@@ -1198,20 +1802,11 @@ impl EditorApp {
         }
 
         if selected {
-            painter.rect_stroke(
-                rect,
-                0.0,
+            painter.add(egui::Shape::closed_line(
+                corners.to_vec(),
                 egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 160, 255)),
-                egui::StrokeKind::Middle,
-            );
-            // Corner handles.
-            for corner in ResizeCorner::all() {
-                let p = match corner {
-                    ResizeCorner::TopLeft => rect.left_top(),
-                    ResizeCorner::TopRight => rect.right_top(),
-                    ResizeCorner::BottomLeft => rect.left_bottom(),
-                    ResizeCorner::BottomRight => rect.right_bottom(),
-                };
+            ));
+            for p in corners {
                 let handle = egui::Rect::from_center_size(p, egui::vec2(8.0, 8.0));
                 painter.rect_filled(handle, 2.0, egui::Color32::WHITE);
                 painter.rect_stroke(
@@ -1225,32 +1820,55 @@ impl EditorApp {
     }
 
     /// Paint the annotation currently being drawn.
-    fn paint_interaction(&self, ui: &egui::Ui, page: usize, page_rect: egui::Rect) {
+    fn paint_interaction(&self, ui: &egui::Ui, _page: usize, page_rect: egui::Rect) {
         let painter = ui.painter();
         match &self.interaction {
             Interaction::Drawing { kind, drag } => {
                 let rect = egui::Rect::from_min_max(drag.start, drag.current);
                 let style = self.current_style();
-                let s = self.effective_scale(page);
-                let fake = Annotation {
-                    id: 0,
-                    kind: *kind,
-                    rect: PdfRect::new_from_values(0.0, 0.0, 0.0, 0.0),
-                    points: Vec::new(),
-                    text: self.text_buffer.clone(),
-                    style,
-                    font_size: self.font_size,
-                    image_path: None,
-                    image_size: None,
+                let fill = |c: [u8; 4]| {
+                    egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
                 };
-                let _ = s;
-                self.paint_annotation(ui, &fake, rect, 1.0, false);
+                let stroke_w = style.width.max(0.5);
+                match kind {
+                    AnnotationKind::Highlight => {
+                        let c = style.fill.unwrap_or([255, 220, 0, 110]);
+                        painter.rect_filled(rect, 0.0, fill(c));
+                    }
+                    AnnotationKind::Rectangle => {
+                        if let Some(c) = style.fill {
+                            painter.rect_filled(rect, 0.0, fill(c));
+                        }
+                        if let Some(c) = style.stroke {
+                            painter.rect_stroke(
+                                rect,
+                                0.0,
+                                egui::Stroke::new(stroke_w, fill(c)),
+                                egui::StrokeKind::Middle,
+                            );
+                        }
+                    }
+                    AnnotationKind::Ellipse => {
+                        let radius = rect.size() / 2.0;
+                        if let Some(c) = style.fill {
+                            painter.add(egui::Shape::ellipse_filled(rect.center(), radius, fill(c)));
+                        }
+                        if let Some(c) = style.stroke {
+                            painter.add(egui::Shape::ellipse_stroke(
+                                rect.center(),
+                                radius,
+                                egui::Stroke::new(stroke_w, fill(c)),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
             }
             Interaction::Inking { page, points } if points.len() >= 2 => {
                 let s = self.effective_scale(*page);
                 let pts: Vec<egui::Pos2> = points
                     .iter()
-                    .map(|(x, y)| egui::pos2(page_rect.min.x + x * s, page_rect.max.y - y * s))
+                    .map(|(x, y)| self.pdf_to_screen(*page, page_rect, *x, *y))
                     .collect();
                 painter.add(egui::Shape::line(
                     pts,
@@ -1295,10 +1913,14 @@ impl EditorApp {
             }
             Tool::Ink => self.handle_ink(page, page_rect, response, pos, inside),
             Tool::Text => self.handle_text_click(page, page_rect, response, pos, inside),
+            Tool::EditText => self.handle_text_edit_click(page, page_rect, response, pos, inside),
             Tool::Image => {
                 if inside && response.clicked() {
                     self.image_dialog();
                 }
+            }
+            Tool::ImageSelect => {
+                self.handle_image_select_click(page, page_rect, response, pos, inside)
             }
         }
     }
@@ -1321,18 +1943,15 @@ impl EditorApp {
             && sel_page == page
             && let Some(a) = doc.annotations[page].iter().find(|a| a.id == id).cloned()
         {
-            let s = self.effective_scale(page);
             let (l, b, r, t) = a.bounds_f32();
-            let rect = egui::Rect::from_min_max(
-                egui::pos2(page_rect.min.x + l * s, page_rect.max.y - t * s),
-                egui::pos2(page_rect.min.x + r * s, page_rect.max.y - b * s),
-            );
+            let corners = self.page_rect_corners(page, page_rect, l, b, r, t);
             for corner in ResizeCorner::all() {
+                // corners = [bottom-left, bottom-right, top-right, top-left].
                 let p = match corner {
-                    ResizeCorner::TopLeft => rect.left_top(),
-                    ResizeCorner::TopRight => rect.right_top(),
-                    ResizeCorner::BottomLeft => rect.left_bottom(),
-                    ResizeCorner::BottomRight => rect.right_bottom(),
+                    ResizeCorner::TopLeft => corners[3],
+                    ResizeCorner::TopRight => corners[2],
+                    ResizeCorner::BottomLeft => corners[0],
+                    ResizeCorner::BottomRight => corners[1],
                 };
                 let handle = egui::Rect::from_center_size(p, egui::vec2(14.0, 14.0));
                 if handle.contains(pos) {
@@ -1471,7 +2090,445 @@ impl EditorApp {
         a.font_size = self.font_size;
         a.style = self.current_style();
         a.rect = PdfRect::new_from_values(y, x, y + h, x + w);
-        self.commit_annotation(a);
+        self.commit_annotation(page, a);
+    }
+
+    /// Drop cached original-text runs after page operations.
+    fn invalidate_text_runs(&mut self) {
+        if let Some(doc) = self.document.as_ref() {
+            let page_count = doc.page_count;
+            self.text_runs = vec![Vec::new(); page_count];
+            self.text_runs_valid = vec![false; page_count];
+        }
+        self.selected_text_run = None;
+        self.selected_word = None;
+    }
+
+    /// Make sure the original-text runs for a page are extracted and cached.
+    fn ensure_text_runs(&mut self, page: usize) {
+        if self.text_runs_valid.get(page).copied().unwrap_or(false) {
+            return;
+        }
+
+        let runs = match self.document.as_ref().map(|doc| doc.text_runs(page)) {
+            Some(Ok(runs)) => runs,
+            Some(Err(e)) => {
+                self.status = format!("Could not read page text: {e}");
+                return;
+            }
+            None => return,
+        };
+
+        if let Some(slot) = self.text_runs.get_mut(page) {
+            *slot = runs;
+            self.text_runs_valid[page] = true;
+        }
+    }
+
+    /// Handle clicks while the Edit Text tool is active.
+    fn handle_text_edit_click(
+        &mut self,
+        page: usize,
+        page_rect: egui::Rect,
+        response: egui::Response,
+        pos: egui::Pos2,
+        inside: bool,
+    ) {
+        // Process an in-progress drag first so it keeps working even when the
+        // pointer has left the page rectangle mid-gesture.
+        if response.dragged()
+            && let Some((drag_page, drag_index)) = self.text_drag
+            && drag_page == page
+        {
+            let delta = response.drag_delta();
+            let scale = self.effective_scale(page);
+            let dx_pt = delta.x / scale;
+            let dy_pt = -delta.y / scale;
+            self.text_drag_offset.0 += dx_pt;
+            self.text_drag_offset.1 += dy_pt;
+            if let Some(doc) = self.document.as_mut()
+                && let Err(e) = doc.translate_text_object(page, drag_index, dx_pt, dy_pt)
+            {
+                self.error = Some(format!("Could not move text: {e}"));
+            }
+            return;
+        }
+
+        if response.drag_stopped()
+            && let Some((drag_page, drag_index)) = self.text_drag.take()
+        {
+            let before = self.text_drag_start_matrix.take();
+            self.text_drag_offset = (0.0, 0.0);
+            let after = self
+                .document
+                .as_ref()
+                .and_then(|doc| doc.text_object_matrix(drag_page, drag_index).ok());
+            if let Some(doc) = self.document.as_mut() {
+                doc.refresh_render_docs(self.pdfium);
+            }
+            self.cache.retain(|(p, _)| *p != drag_page);
+            self.thumbs.retain(|(p, _)| *p != drag_page);
+            self.invalidate_text_runs();
+            self.dirty = true;
+            if let (Some(before), Some(after)) = (before, after) {
+                self.undo.push(
+                    "Move text",
+                    DocumentEdit::TextMove(TextMove {
+                        page: drag_page,
+                        object_index: drag_index,
+                        before_matrix: before,
+                        after_matrix: after,
+                    }),
+                );
+            }
+            self.status = "Text moved".into();
+            return;
+        }
+
+        if !inside {
+            return;
+        }
+
+        self.ensure_text_runs(page);
+
+        let (x, y) = self.screen_to_pdf(page, page_rect, pos);
+        let tolerance = 6.0 / self.effective_scale(page);
+        let hit = self.text_runs.get(page).and_then(|runs| {
+            runs.iter()
+                .enumerate()
+                .rev()
+                .find(|(_, run)| run.contains_point(x, y, tolerance))
+                .map(|(index, _)| index)
+        });
+        let word_hit = self.text_runs.get(page).and_then(|runs| {
+            runs.iter().enumerate().rev().find_map(|(ri, run)| {
+                run.words
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, w)| w.contains_point(x, y, tolerance))
+                    .map(|(wi, _)| (ri, wi))
+            })
+        });
+
+        // Drag to move the original text.
+        if response.drag_started() {
+            let run_index = hit.or_else(|| {
+                self.selected_text_run
+                    .filter(|(p, _)| *p == page)
+                    .map(|(_, i)| i)
+            });
+            if let Some(run_index) = run_index {
+                let run = self
+                    .text_runs
+                    .get(page)
+                    .and_then(|r| r.get(run_index))
+                    .cloned();
+                if let Some(run) = run {
+                    let result = self.document.as_ref().and_then(|doc| {
+                        let object_index = doc.text_object_index_for_run(page, &run).ok()?;
+                        let matrix = doc.text_object_matrix(page, object_index).ok();
+                        Some((object_index, matrix))
+                    });
+                    if let Some((object_index, start_matrix)) = result {
+                        self.selected_text_run = Some((page, run_index));
+                        self.text_drag = Some((page, object_index));
+                        self.text_drag_start_matrix = start_matrix;
+                        self.text_drag_offset = (0.0, 0.0);
+                        self.status = "Move text".into();
+                    } else {
+                        self.status =
+                            "Couldn't move this text (no matching text object)".into();
+                    }
+                }
+            }
+            return;
+        }
+
+        if response.double_clicked() {
+            if let Some((run_index, word_index)) = word_hit {
+                self.start_word_edit(page, run_index, word_index);
+            } else if let Some(run_index) = hit {
+                self.start_text_edit(page, run_index);
+            }
+            return;
+        }
+
+        if response.clicked() {
+            if let Some((run_index, word_index)) = word_hit {
+                self.selected_text_run = Some((page, run_index));
+                self.selected_word = Some((page, run_index, word_index));
+                self.status =
+                    "Word selected — drag to move, double-click to edit it".into();
+            } else if let Some(run_index) = hit {
+                self.selected_text_run = Some((page, run_index));
+                self.selected_word = None;
+                self.status =
+                    "Text line selected — drag to move, double-click to edit".into();
+            } else {
+                self.selected_text_run = None;
+                self.selected_word = None;
+            }
+        }
+    }
+
+    /// Begin an in-place edit for the given original-text run.
+    fn start_text_edit(&mut self, page: usize, run_index: usize) {
+        if self
+            .text_edits
+            .iter()
+            .any(|e| e.page == page && e.run_index == run_index)
+        {
+            self.status = "This line already has a staged edit — undo it first".into();
+            return;
+        }
+
+        let Some(run) = self
+            .text_runs
+            .get(page)
+            .and_then(|runs| runs.get(run_index))
+        else {
+            return;
+        };
+        let scale = self.effective_scale(page);
+        self.text_edit_state = Some(TextEditState {
+            page,
+            run_index,
+            word_index: None,
+            original: run.text.clone(),
+            buffer: run.text.clone(),
+            font_size: (run.font_size * scale).max(10.0),
+        });
+        self.text_edit_should_focus = true;
+        self.selected_text_run = Some((page, run_index));
+        self.status = "Editing text — Enter to apply, Esc to cancel".into();
+    }
+
+    /// Begin an in-place edit for a single word within a run.
+    fn start_word_edit(&mut self, page: usize, run_index: usize, word_index: usize) {
+        let Some(run) = self
+            .text_runs
+            .get(page)
+            .and_then(|runs| runs.get(run_index))
+        else {
+            return;
+        };
+        let Some(word) = run.words.get(word_index) else {
+            return;
+        };
+        let scale = self.effective_scale(page);
+        self.text_edit_state = Some(TextEditState {
+            page,
+            run_index,
+            word_index: Some(word_index),
+            original: word.text.clone(),
+            buffer: word.text.clone(),
+            font_size: (run.font_size * scale).max(10.0),
+        });
+        self.text_edit_should_focus = true;
+        self.selected_text_run = Some((page, run_index));
+        self.selected_word = Some((page, run_index, word_index));
+        self.status = "Editing word — Enter to apply, Esc to cancel".into();
+    }
+
+    /// Finish an in-place edit, staging a dry-run text edit in the UI model.
+    fn commit_text_edit(&mut self) {
+        let Some(state) = self.text_edit_state.take() else {
+            return;
+        };
+        if state.buffer.trim().is_empty() || state.buffer == state.original {
+            self.status = "Text edit cancelled".into();
+            return;
+        }
+
+        let page = state.page;
+        let run_index = state.run_index;
+        let word_index = state.word_index;
+        let edited_text = state.buffer.clone();
+
+        let Some(run) = self
+            .text_runs
+            .get(page)
+            .and_then(|runs| runs.get(run_index))
+            .cloned()
+        else {
+            self.error = Some("Could not find the text run to edit".into());
+            return;
+        };
+
+        // A word edit snapshots the full line before/after; a line edit uses
+        // `edited_text` directly as the new line text.
+        let (run_original, run_new, applied) = match word_index {
+            Some(wi) => {
+                let Some(word) = run.words.get(wi).cloned() else {
+                    self.error = Some("Could not find the word to edit".into());
+                    return;
+                };
+                let run_new = run.text.replacen(&word.text, &edited_text, 1);
+                let applied = match self.document.as_mut() {
+                    Some(doc) => match doc.apply_word_edit(page, &word, &edited_text) {
+                        Ok(applied) => applied,
+                        Err(e) => {
+                            self.error = Some(format!("Could not edit word: {e}"));
+                            return;
+                        }
+                    },
+                    None => return,
+                };
+                (run.text.clone(), run_new, applied)
+            }
+            None => {
+                let applied = match self.document.as_mut() {
+                    Some(doc) => match doc.apply_text_edit(page, &run, &edited_text) {
+                        Ok(applied) => applied,
+                        Err(e) => {
+                            self.error = Some(format!("Could not edit text: {e}"));
+                            return;
+                        }
+                    },
+                    None => return,
+                };
+                (run.text.clone(), edited_text.clone(), applied)
+            }
+        };
+
+        if let Some(doc) = self.document.as_mut() {
+            doc.refresh_render_docs(self.pdfium);
+        }
+
+        self.dirty = true;
+        self.text_edits.clear();
+        self.text_runs_valid[page] = false;
+        if let Some(run) = self
+            .text_runs
+            .get_mut(page)
+            .and_then(|runs| runs.get_mut(run_index))
+        {
+            run.text = run_new.clone();
+        }
+        self.cache.retain(|(p, _)| *p != page);
+        self.thumbs.retain(|(p, _)| *p != page);
+        self.selected_text_run = None;
+        self.selected_word = None;
+        self.status = "Text edit applied".into();
+
+        self.undo.push(
+            "edit text",
+            DocumentEdit::Text(TextEdit {
+                page,
+                run_index,
+                run_original,
+                run_new,
+                object_original: applied.object_original,
+                object_new: applied.object_new,
+                object_index: applied.object_index,
+            }),
+        );
+    }
+
+    /// Cancel the in-place edit without changing anything.
+    fn cancel_text_edit(&mut self) {
+        self.text_edit_state = None;
+        self.text_edit_should_focus = false;
+        self.status = "Text edit cancelled".into();
+    }
+
+    /// Delete the currently selected original-text word, undoable.
+    fn delete_selected_word(&mut self) {
+        let Some((page, run_index, word_index)) = self.selected_word else {
+            return;
+        };
+        let Some(run) = self
+            .text_runs
+            .get(page)
+            .and_then(|r| r.get(run_index))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(word) = run.words.get(word_index).cloned() else {
+            return;
+        };
+
+        let run_original = run.text.clone();
+        let run_new = run.text.replacen(&word.text, "", 1);
+
+        let applied = match self.document.as_mut() {
+            Some(doc) => match doc.apply_word_edit(page, &word, "") {
+                Ok(applied) => applied,
+                Err(e) => {
+                    self.error = Some(format!("Could not delete word: {e}"));
+                    return;
+                }
+            },
+            None => return,
+        };
+
+        if let Some(doc) = self.document.as_mut() {
+            doc.refresh_render_docs(self.pdfium);
+        }
+        self.dirty = true;
+        self.invalidate_text_runs();
+        self.cache.retain(|(p, _)| *p != page);
+        self.thumbs.retain(|(p, _)| *p != page);
+        self.status = "Word deleted".into();
+
+        self.undo.push(
+            "delete word",
+            DocumentEdit::Text(TextEdit {
+                page,
+                run_index,
+                run_original,
+                run_new,
+                object_original: applied.object_original,
+                object_new: applied.object_new,
+                object_index: applied.object_index,
+            }),
+        );
+    }
+
+
+    /// Draw and drive the in-place original-text editor overlay.
+    fn show_text_edit_overlay(&mut self, ui: &mut egui::Ui) {
+        let Some(rect) = self.text_edit_rect.take() else {
+            return;
+        };
+        let Some(mut state) = self.text_edit_state.take() else {
+            return;
+        };
+
+        let should_focus = std::mem::take(&mut self.text_edit_should_focus);
+        let field_width = rect.width().max(140.0);
+
+        // `rect` is in global screen points; `ui.put` accepts coordinates in
+        // the same global point space, so pass it through unchanged.
+        let response = ui.put(
+            rect,
+            egui::TextEdit::singleline(&mut state.buffer)
+                .font(egui::FontId::proportional(state.font_size))
+                .desired_width(field_width),
+        );
+        if should_focus {
+            response.request_focus();
+        }
+
+        // Keep requesting focus until the overlay actually has it.
+        if should_focus && !response.has_focus() {
+            self.text_edit_should_focus = true;
+        }
+
+        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        let click_away = response.lost_focus() && !enter && !escape;
+
+        if escape {
+            self.cancel_text_edit();
+        } else if enter || click_away {
+            self.text_edit_state = Some(state);
+            self.commit_text_edit();
+        } else {
+            self.text_edit_state = Some(state);
+        }
     }
 
     /// Advance any in-progress interaction using the current pointer state.
@@ -1525,7 +2582,7 @@ impl EditorApp {
                         let b = points.iter().map(|p| p.1).fold(f32::MAX, f32::min);
                         let t = points.iter().map(|p| p.1).fold(f32::MIN, f32::max);
                         a.rect = PdfRect::new_from_values(b, l, t, r);
-                        self.commit_annotation(a);
+                        self.commit_annotation(page, a);
                     }
                 } else {
                     self.interaction = Interaction::Inking { page, points };
@@ -1670,7 +2727,7 @@ impl EditorApp {
                 to_pdf,
             );
             annotation.font_size = self.font_size;
-            self.commit_annotation(annotation);
+            self.commit_annotation(page, annotation);
         }
     }
 
@@ -1684,97 +2741,76 @@ impl EditorApp {
         self.page_rects.get(page).copied()
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let Some(doc) = self.document.as_ref() else {
-            return;
-        };
-        let total = doc.page_count;
-        let current = self.current_page;
-        let aspects: Vec<f32> = (0..total)
-            .map(|p| {
-                let p = doc.pages.get(p).copied().unwrap_or(pdf_viewer::PageInfo {
-                    width_pts: 612.0,
-                    height_pts: 792.0,
-                    rotation: PdfPageRenderRotation::None,
-                });
-                p.width_pts / p.height_pts
-            })
-            .collect();
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    for (page, &aspect) in aspects.iter().enumerate().take(total) {
-                        let thumb_w = (ui.available_width() - 8.0).min(150.0);
-                        let size = egui::vec2(thumb_w, thumb_w / aspect);
-
-                        let frame_fill = if page == current {
-                            ui.style().visuals.selection.bg_fill
-                        } else {
-                            ui.style().visuals.widgets.inactive.bg_fill
-                        };
-
-                        let frame = egui::Frame::new()
-                            .fill(frame_fill)
-                            .corner_radius(4.0)
-                            .inner_margin(4.0);
-
-                        let inner = frame.show(ui, |ui| {
-                            ui.vertical_centered(|ui| {
-                                if let Some((_, tex)) = self.thumbs.iter().find(|(p, _)| *p == page)
-                                {
-                                    let img = egui::Image::from_texture(tex)
-                                        .max_size(size)
-                                        .maintain_aspect_ratio(true);
-                                    ui.add(img);
-                                } else {
-                                    let (rect, _) =
-                                        ui.allocate_exact_size(size, egui::Sense::hover());
-                                    ui.painter().rect_filled(
-                                        rect,
-                                        2.0,
-                                        egui::Color32::from_gray(if page == current {
-                                            90
-                                        } else {
-                                            55
-                                        }),
-                                    );
-                                }
-                                ui.label(
-                                    egui::RichText::new(format!("{}", page + 1)).small().weak(),
-                                );
-                            });
-                        });
-
-                        let click = ui.interact(
-                            inner.response.rect,
-                            ui.scope_id().with(("thumb", page)),
-                            egui::Sense::click(),
-                        );
-                        if click.clicked() {
-                            self.go_to(page);
-                        }
-                        ui.add_space(6.0);
-                    }
-                });
-            });
-    }
 }
 
 impl eframe::App for EditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_dialogs();
+        self.poll_search();
+        self.tick_search(&ctx);
         self.update_interaction(&ctx);
+
+        // Intercept window close when there are unsaved changes.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.dirty
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(PendingConfirm::Close);
+        }
+
+        // ⌘F focuses the search field; Escape clears the search.
+        let cmd_f = ctx.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::F,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.command || modifiers.mac_cmd
+                )
+            })
+        });
+        if cmd_f && self.document.is_some() {
+            self.search_should_focus = true;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !self.search_hits.is_empty() {
+            self.clear_search();
+            if let Some(id) = self.search_field_id {
+                ctx.memory_mut(|m| m.surrender_focus(id));
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.selected_text_run = None;
+            self.selected_word = None;
+            self.selected_image = None;
+            self.image_drag = None;
+        }
+        // F1 toggles the help window.
+        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.show_help = !self.show_help;
+        }
 
         // Keyboard shortcuts.
         let typing = ctx.memory(|m| m.focused().is_some());
         if !typing {
+            if ctx.input(|i| i.key_pressed(egui::Key::Enter))
+                && self.text_edit_state.is_none()
+                && self.tool == Tool::EditText
+                && let Some((page, run_index)) = self.selected_text_run
+            {
+                self.start_text_edit(page, run_index);
+            }
             if ctx
                 .input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
             {
-                self.delete_selected();
+                if self.selected_word.is_some() {
+                    self.delete_selected_word();
+                } else {
+                    self.delete_selected();
+                }
             }
             if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
                 self.save();
@@ -1819,11 +2855,22 @@ impl eframe::App for EditorApp {
         }
         egui::CentralPanel::default().show(ui, |ui| self.central_panel(ui));
 
+        // Floating help window.
+        self.help_window(&ctx);
+
+        // OCR result preview, if enabled.
+        #[cfg(feature = "ocr")]
+        self.page_text_window(&ctx);
+
+        // Unsaved-changes confirmation, if pending.
+        self.show_confirm_window(&ctx);
+
         // Keep repainting while background work is running.
         let busy = !self.thumb_rendering.lock().unwrap().is_empty()
             || !self.thumb_pending.lock().unwrap().is_empty()
             || !self.rendering.lock().unwrap().is_empty()
-            || self.pending.lock().unwrap().is_some();
+            || self.pending.lock().unwrap().is_some()
+            || self.search_rx.is_some();
         if busy {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
@@ -1831,65 +2878,52 @@ impl eframe::App for EditorApp {
     }
 }
 
-/// Render one page as a small thumbnail, width-clamped to `target_w` pixels.
-fn render_thumbnail(
-    doc: &PdfDocument<'static>,
-    page_index: usize,
-    target_w: i32,
-) -> egui::ColorImage {
-    let blank = |w: i32, h: i32| {
-        egui::ColorImage::new(
-            [w.max(1) as usize, h.max(1) as usize],
-            vec![egui::Color32::from_gray(60); (w.max(1) * h.max(1)) as usize],
-        )
-    };
+/// Sample a page-space ellipse into screen-space points (32 segments).
+fn ellipse_pts(
+    app: &EditorApp,
+    page: usize,
+    page_rect: egui::Rect,
+    l: f32,
+    b: f32,
+    r: f32,
+    t: f32,
+) -> Vec<egui::Pos2> {
+    let cx = (l + r) / 2.0;
+    let cy = (b + t) / 2.0;
+    let rx = ((r - l) / 2.0).abs();
+    let ry = ((t - b) / 2.0).abs();
+    const N: usize = 32;
+    (0..N)
+        .map(|i| {
+            let theta = (i as f32 / N as f32) * std::f32::consts::TAU;
+            app.pdf_to_screen(page, page_rect, cx + rx * theta.cos(), cy + ry * theta.sin())
+        })
+        .collect()
+}
 
-    let Ok(page) = doc.pages().get(page_index as i32) else {
-        return blank(target_w, target_w);
-    };
-    let w_pts = page.width().value.max(1.0);
-    let h_pts = page.height().value.max(1.0);
-    let scale = (target_w as f32 / w_pts).clamp(0.05, 4.0);
-    let width = (w_pts * scale).max(1.0) as i32;
-    let height = (h_pts * scale).max(1.0) as i32;
-
-    let config = PdfRenderConfig::new()
-        .set_target_width(width)
-        .set_target_height(height)
-        .set_reverse_byte_order(true);
-
-    match page.render_with_config(&config) {
-        Ok(bitmap) => {
-            let rgba = bitmap.as_rgba_bytes();
-            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba)
+/// Locate the Tesseract `tessdata` directory, checking the app bundle first
+/// (packaged) then Homebrew locations (development).
+#[cfg(feature = "ocr")]
+fn tessdata_dir() -> Option<std::path::PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        let candidates = vec![
+            exe.parent().map(|p| p.join("tessdata")),
+            exe.parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("Resources").join("tessdata")),
+        ];
+        for c in candidates.into_iter().flatten() {
+            if c.join("eng.traineddata").exists() {
+                return Some(c);
+            }
         }
-        Err(_) => blank(width, height),
     }
+    for p in ["/opt/homebrew/share/tessdata", "/usr/local/share/tessdata"] {
+        let path = std::path::PathBuf::from(p);
+        if path.join("eng.traineddata").exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
-/// Render one page into an RGBA image for the editor canvas.
-fn render_page(doc: &PdfDocument<'static>, page_index: usize, scale: f32) -> egui::ColorImage {
-    let placeholder = |w: f32, h: f32| {
-        let w = w.clamp(1.0, 4000.0) as usize;
-        let h = h.clamp(1.0, 4000.0) as usize;
-        egui::ColorImage::new([w, h], vec![egui::Color32::from_gray(200); w * h])
-    };
-
-    let Ok(page) = doc.pages().get(page_index as i32) else {
-        return placeholder(612.0 * scale, 792.0 * scale);
-    };
-    let width = (page.width().value * scale).max(1.0) as i32;
-    let height = (page.height().value * scale).max(1.0) as i32;
-
-    let config = PdfRenderConfig::new()
-        .set_target_width(width)
-        .set_target_height(height)
-        .set_reverse_byte_order(true);
-
-    let Ok(bitmap) = page.render_with_config(&config) else {
-        return placeholder(width as f32, height as f32);
-    };
-
-    let rgba = bitmap.as_rgba_bytes();
-    egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba)
-}
