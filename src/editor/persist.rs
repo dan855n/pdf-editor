@@ -1,15 +1,26 @@
 //! Small persistence helpers: last-opened file/page and theme preference.
 //!
-//! State lives in a plain text file (`~/.local/share/pdf-editor/state.txt`)
-//! with three lines: last file path, last page (0-based), theme preference.
+//! State lives in a plain text file — `~/.local/share/pdf-editor/state.txt`
+//! on macOS/Linux, `%LOCALAPPDATA%\pdf-editor\state.txt` on Windows — with
+//! three lines: last file path, last page (0-based), theme preference.
 
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
 fn state_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let dir = PathBuf::from(home).join(".local/share/pdf-editor");
+    let dir = if cfg!(target_os = "windows") {
+        std::env::var("LOCALAPPDATA")
+            .or_else(|_| std::env::var("APPDATA"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            })
+            .join("pdf-editor")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".local/share/pdf-editor")
+    };
     let _ = std::fs::create_dir_all(&dir);
     dir.join("state.txt")
 }

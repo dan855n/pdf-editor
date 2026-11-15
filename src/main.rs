@@ -1255,8 +1255,18 @@ impl eframe::App for PdfViewerApp {
 // -------------------------------------------------------------- persistence
 
 fn state_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let dir = PathBuf::from(home).join(".local/share/pdf-viewer");
+    let dir = if cfg!(target_os = "windows") {
+        std::env::var("LOCALAPPDATA")
+            .or_else(|_| std::env::var("APPDATA"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            })
+            .join("pdf-viewer")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".local/share/pdf-viewer")
+    };
     let _ = std::fs::create_dir_all(&dir);
     dir.join("state.txt")
 }

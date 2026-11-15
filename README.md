@@ -89,6 +89,25 @@ NOTARY_PROFILE="my-profile" packaging/build-universal-app.sh
 
 Create the profile once with `xcrun notarytool store-credentials`.
 
+## Windows build
+
+Build a self-contained Windows x64 build from macOS (cross-compile with MinGW):
+
+```sh
+brew install mingw-w64
+rustup target add x86_64-pc-windows-gnu
+packaging/build-windows.sh
+```
+
+The result lands in `dist/PDF-Editor-Windows-x64.zip`, containing `PDF Editor.exe`
+and `pdfium.dll` (keep the two together). It is not code-signed, so Windows
+SmartScreen may show a "Windows protected your PC" prompt — click **More info** →
+**Run anyway**.
+
+OCR is not available on the Windows build (Tesseract's C library cannot be
+cross-compiled from macOS). Text editing, annotations, page tools, and search
+all work.
+
 ## OCR
 
 OCR is powered by the open-source [Tesseract](https://github.com/tesseract-ocr/tesseract)
