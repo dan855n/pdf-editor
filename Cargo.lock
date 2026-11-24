@@ -2608,6 +2608,7 @@ dependencies = [
  "leptess",
  "pdfium-render",
  "rfd",
+ "windows",
 ]
 
 [[package]]

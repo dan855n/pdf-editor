@@ -258,7 +258,7 @@ embedding/subsetting (Rung 3), paragraph reflow (Rung 4).
 | Render mode (fill/stroke) | `render_mode()` / `set_render_mode()` | ✅ available |
 | Font access | `font()` | ✅ available |
 | Char-level bounds | `chars()` → `PdfPageTextChar::loose_bounds()` | ✅ available |
-| Split one text object into two | — none — | ❌ not exposed; hardest part |
+| Split one text object into two | — none — | ✅ done in §11 by hand: rewrite the parent's text, append prefix/suffix objects with the parent's font token, matrix and colours |
 
 **Key risk:** editing a word inside a *multi-line* text object needs an object
 split, which pdfium-render does not expose directly. Single-line objects are
@@ -289,9 +289,8 @@ double-click-to-edit keeps working.
 - Reuse the existing `TextEdit` undo; refresh render docs + caches. ✅
   (`TextEditState.word_index`; word edits snapshot the full line before/after.)
 - Multi-line objects: fall back to whole-object rewrite, or show a clear
-  "not yet supported" message. ⚠️ Partially handled — word is matched by first
-  occurrence in the object; multi-line objects work only when the word text is
-  unambiguous.
+  "not yet supported" message. ✅ Superseded by §11 — the word is now located by
+  its own character offset inside the object, never by searching for its text.
 
 **Deliverable:** double-clicking a word and typing replaces just that word in
 the saved PDF. (`word_edit_replaces_a_word` test; UI: double-click a selected
@@ -359,3 +358,365 @@ reject with "line shares a text object with other lines".
 4. Insert/delete words work within a line.
 5. Undo/redo covers all of the above.
 6. Non-edited content is unchanged; `cargo test` and clippy stay green.
+
+## 11. Free text dragging — word/span moves (implemented)
+
+**Goal:** stop dragging whole lines only. In a PDFGear-like editor you drag a
+word, or any run of characters, wherever you like and the rest of the line
+stays put.
+
+**Why it was line-only:** the editor drives PDFium's *page object* API. One
+`PdfPageObject::Text` is one text-showing chunk of the page content stream, and
+Word / LibreOffice / LaTeX / InDesign emit roughly one chunk per visual line, so
+`translate_text_object()` can only ever move a line. PDFium has no sub-object
+model — there is no "move word" call to expose. A word becomes free to move only
+once it *is* an object.
+
+### 11.1 Precise object lookup (done)
+
+`text_object_index_for_char()` resolves a character to the object that really
+owns it, using PDFium's own character→object table (`chars_for_object`), not by
+comparing object text. It replaces the old `position(|obj| t.text() == …)` match,
+which silently picked the first lookalike line — `Name:`, `--`, page numbers,
+form labels — and moved or edited the wrong one.
+
+Call sites now routed through it:
+
+| Call site | Before | Now |
+|---|---|---|
+| `text_object_index_for_run` | first object whose text matched | owning object |
+| `apply_text_edit` | first object whose text matched | owning object |
+| `apply_word_edit` | first match by text, then `find(word)` in the string | owning object + `object_text_byte_offset()` |
+
+`text_object_indices_for_char_range()` returns *every* object that owns part of a
+character range, so a line that was split across several objects (ligatures,
+kerning runs, colour changes, superscripts) moves as one piece instead of tearing.
+
+### 11.2 Split-then-translate (done)
+
+`split_text_object_for_span(page, first_char, last_char)` turns the span into its
+own object without changing a single pixel:
+
+1. The span stays in the original object (`span_index`), whose text is set to
+   just the span.
+2. The text before and after it is copied into two new objects that copy the
+   parent's **font token, unscaled size, matrix, fill colour, stroke colour and
+   render mode** — so nothing is re-encoded, re-styled or re-subset.
+3. Both new objects are offset by the span's / suffix's character origin
+   (`PdfPageTextChar::origin()`), so they land exactly where those glyphs were —
+   correct for rotated and scaled text too, not just unrotated lines.
+
+`translate_text_objects()` then moves a set of objects with a single content
+regeneration, so a multi-object drag stays one cheap operation.
+
+### 11.3 Editor behaviour (done)
+
+| Gesture | Result |
+|---|---|
+| Click a word | selects it (starts a new selection) |
+| **Shift-click another word** | selects the whole reading-order range between the anchor and that word — a phrase, part of a line, or across lines |
+| Drag a selected word | moves the **whole selection as one group**; each line's remainder stays put |
+| Drag a word that is not selected | starts a new single-word selection and drags it |
+| Drag elsewhere on a line | move every object the line is made of |
+| Drag with no text under the pointer | moves the current selection |
+| Double-click a word / line | unchanged word / line rewrite |
+
+The ghost preview draws every selected word for a group drag (glyph previews are
+shown for a single word only, where they are readable) and the line for a line
+drag. `DocumentEdit::TextMove` carries `moves: Vec<TextObjectMove>`, so a
+multi-object drag is still a single undo step.
+
+### 11.3.1 Selection grouping
+
+`split_selection_for_move(page, ranges)` takes one `(first, last)` character
+range per line and splits each object's share separately, because a selection can
+straddle text objects: select "the quick **brown** fox" and the phrase may start
+in one object and end in another. The editor groups the selected words by run,
+takes the min/max character index per run, and moves every resulting span with a
+single `translate_text_objects()` call.
+
+### 11.3.2 Gotcha: `text()` is not sliceable
+
+`PdfPageTextObject::text()` can contain characters the object's character list
+does not have — after `set_text()`, PDFium reports an inferred trailing space
+(`"PDF "` for three characters). Slicing that string by character position would
+therefore mis-slice the text, so the split builds its pieces from the character
+list's Unicode values instead (`object_chars_layout()`), and validates the result
+by comparing the rejoined text against `text()` with whitespace ignored.
+Objects whose characters have no Unicode value are refused rather than mangled.
+
+If the split cannot be done (font whose characters do not map one-to-one), the
+drag degrades to the old line move with a clear status message instead of
+failing.
+
+### 11.4 Tests
+
+| Test | Guards |
+|---|---|
+| `run_lookup_finds_the_owning_object` | every run resolves to an object that owns its characters |
+| `splitting_a_word_keeps_the_line_in_place` | the three pieces rejoin exactly; prefix does not move; span moves by the requested delta |
+| `splitting_a_word_changes_nothing_on_screen` | identical character origins and a pixel-level render match after the split |
+| `line_move_covers_every_object_of_the_line` | all objects of a line move together |
+| `moved_word_survives_save_and_reload` | the moved word is at its new position after save → reload |
+| `multi_word_span_moves_as_one_piece` | a phrase splits into one span, moves as a unit, and its line's other words stay |
+| `selection_across_objects_is_split_per_object` | a range crossing object boundaries is split per object and still moves as one group |
+| `two_column_layout_has_one_run_per_line` | two columns sharing baselines stay separate lines, one object each, no `\r` in text |
+| `line_drag_stays_within_its_column` | dragging a left-column line does not move the right column |
+| `multi_line_selection_moves_every_selected_line` | a selection spanning both columns moves every selected line, and only those |
+| `reading_order_is_column_major` / `…_top_down_for_a_single_column` | selection order is column-major |
+| `line_fragments_move_with_their_line` | a line drawn as two objects moves as one line |
+| `multi_line_drag_carries_all_fragments` | every fragment of every selected line moves |
+| `tight_invented_space_does_not_split_a_word` | invented whitespace across a tight fragment boundary stays inside the word |
+| `space_sized_gaps_still_split_words` | real word gaps still separate words |
+| `reflow_closes_the_gap_of_a_removed_line` | lines below a removed line shift up by one leading |
+| `reflow_keeps_paragraph_spacing` / `reflow_leaves_a_footer_alone` | spacing between blocks survives; a footer is not dragged up |
+| `reflow_keeps_the_other_column_alone` | the neighbouring column does not move |
+| `partly_selected_lines_do_not_reflow` | a partly selected line keeps its place |
+
+### 11.4.1 Two-column layouts and paragraph selections (fixed)
+
+Reported symptoms: "it selects a whole paragraph but only the top line moves",
+and "does not work in two columns". Three separate defects were behind them, all
+in how characters were grouped and mapped to objects:
+
+1. **PDFium's synthetic line breaks were treated as text.** Its text page contains
+   `\r` / `\n` characters that belong to no text object. They were being pushed
+   into runs (so run text contained `\r\n`) and into word splitting.
+   → `group_chars_into_runs()` now cuts the character stream into blocks at any
+   control character, then groups each block by baseline. A run therefore never
+   spans a line break, and the block boundary is PDFium's own idea of "new line".
+
+2. **Runs were grouped by baseline alone, so the two columns fused.** Left and
+   right column text share baselines, so one "run" covered both — with a text
+   string `"Left column…\r\nRight column…"` and a character index range
+   `0..157` that swept up every line in between. Selecting that run selected the
+   paragraph, and dragging it moved the wrong objects.
+   → Blocks fix the common case; a fallback geometry break (gap > 2em) covers
+   producers that emit no line break between columns.
+
+3. **Object resolution and splitting used `first..=last` index ranges.** A range is
+   only meaningful when a selection's characters are contiguous page indices,
+   which two-column text and merged runs are not.
+   → `TextRun` and `Word` now carry the actual character set (`chars`), and the
+   document API takes sets: `text_object_indices_for_chars(page, chars)` and
+   `split_selection_for_move(page, groups)`. The editor passes `run.chars`
+   (line drag) and each selected line's word characters (group drag). Range-based
+   `text_object_indices_for_char_range()` is gone.
+
+Selection *order* was also line-by-line across the whole page, so shift-clicking
+down the left column picked up the right column's lines too. `reading_order()`
+now clusters runs into columns by horizontal overlap and orders column-major
+(top to bottom inside a column), which leaves single-column documents unchanged.
+
+Verified on a generated two-column PDF (`examples/make_layout_pdf.rs`): each of
+the 7 lines is its own run backed by exactly one object; dragging one left-column
+line leaves the right column untouched; a 3-line selection spanning both columns
+moves all three and nothing else.
+
+### 11.4.2 Drags leaving the first letters behind (fixed)
+
+Reported on a real two-column bulletin: selecting two lines and dragging left the
+first letter or two of a line behind ("A_", "tr" in the screenshot). Two causes:
+
+1. **`set_text()` shortens the page's character stream.** When a split rewrote an
+   object's text, PDFium's *inferred* trailing space disappeared with it. The page
+   then had one character fewer, so every later character index shifted by one —
+   and the next line's split, computed from indices taken before the rewrite,
+   landed one character too far in. Its first character therefore stayed in the
+   unselected prefix. With several lines the error accumulated (1, 2, 4, … chars
+   left behind), which is exactly the pattern that was reported.
+   → Splitting is now **plan-then-apply**: every split is planned from the
+   untouched page (`plan_object_split()`), and only then applied
+   (`apply_object_split()`), so no index is ever read after a mutation. A selection
+   that covers a whole object no longer rewrites its text at all.
+
+2. **PDFium invents a space at fragment boundaries.** Any gap wider than ~0.15em
+   between two text objects becomes a space character belonging to no object, so a
+   line drawn as fragments ("tr" + "ust.") was modelled as two words — dragging one
+   left the other behind.
+   → Invented, unowned whitespace separates words only when the gap around it is
+   really space-sized (≥ 0.2em). Real space characters still always separate.
+
+A split also no longer leaves debris behind: the source piece of a moved span keeps
+its glyphs only if it still has some, and a piece that would hold nothing but
+whitespace is erased (`set_text("")`) or not created at all, so the page is not left
+with blank text objects after a drag.
+
+With those two fixes the reported gesture works on the document that showed it:
+selecting from "Leader: When we stand…" through "…humble" produced six complete
+line spans and moved them as one group, with nothing left at the source.
+
+### 11.4.3 Closing the gap: paragraph reflow (implemented)
+
+Dragging a whole line away used to leave a hole exactly as tall as the line.
+`reflow_after_removal()` now closes it: everything below the removed line **in the
+same column** moves up by the document's own leading, so the paragraph — and
+everything under it — slides up as one.
+
+Details that make it behave on real documents:
+
+- **Leading is measured, not assumed.** The column's line pitch is the lower
+  quartile of its baseline gaps, because templates routinely set text looser than
+  1.2 em (the reported bulletin uses 11 pt type on a 17–20 pt pitch).
+- **The whole hole closes.** Everything below moves up by the removed line's entire
+  vertical slot — its pitch *plus* whatever paragraph break followed it. Shifting
+  by one leading only is not enough: a removed line that sat above a paragraph
+  break leaves the break behind as a hole under the heading that preceded it.
+- **Wide gaps are respected.** A gap over 3× the leading (a footer, a page number)
+  is treated as a separate block and stays put; the whitespace above it absorbs the
+  shift. Removing a line never drags a footer up.
+- **Only whole lines count.** A line counts as removed only when *all* its runs'
+  words are selected. Move one word out of a line and the line keeps its place —
+  otherwise the rest of the sentence would be pulled over the hole.
+- **One undo step.** The shifts are recorded as extra matrix moves in the same
+  `TextMove` as the drag, so a single undo restores both the text and the layout.
+
+What this is *not*: it does not re-wrap or re-break lines, and it does not insert
+the dropped text into a paragraph at the destination. Moving a line out of the
+middle of a paragraph shortens that paragraph without pulling words up from the
+line below; proper re-wrapping needs line breaking with the embedded font's metrics
+(Stage 4 in the original plan).
+
+### 11.4.4 Moving justified text (root cause found, fix proven)
+
+Dragging a line inside a **justified** paragraph (`The Lord's Prayer` on the test
+bulletin) made it render spread across the page, while text extraction still
+reported normal positions and widths — which is why it first looked like a
+character-to-object mapping bug. It is not: every line maps to exactly one object.
+
+The cause is PDFium's page-object API. A moved object is re-serialised on
+`FPDFPage_RegenerateContent()`, and for justified text that re-serialisation
+re-emits the line's justification as extreme inter-word adjustments. Ragged-right
+text is unaffected, which is why the left column always moved perfectly.
+
+Attempts that do **not** work, all reverted:
+
+| Attempt | Result |
+|---|---|
+| One regeneration for a whole batch (`PdfPageContentRegenerationStrategy::Manual`) | no change |
+| Stretch the moved line back to its original width (matrix scale about its left edge) | width restored exactly, spacing still wrong |
+| Re-issue the object's own text before moving (`set_text`) | worse: PDFium re-parsed the page and split lines into fragments |
+
+What **does** work, proven on the bulletin: *author a fresh object* instead of
+moving the parsed one. Read the line's text, font token, size, matrix, colours and
+its exact width; create a new text object at the target; stretch it to the original
+width; blank the original (`set_text("")`, which keeps all object indices stable).
+Objects we author render cleanly, and the stretched copy keeps the line's justified
+extent, so a moved justified line is indistinguishable from its neighbours.
+
+Making that the move path is a contained but real refactor, because the current
+undo records *matrix* snapshots (`TextMove`) — a redrawn line has no such matrix.
+It needs a `TextRedraw` record (original index + text + matrix, plus the copy's
+index), the split path to author its first piece as a fresh object too, and the
+matrix-based move tests rewritten to assert geometry.
+
+### 11.4.5 Re-authoring moved lines: justified text fixed, slots still off
+
+`Document::repair_moved_text()` re-authors every line a gesture moved as a fresh
+object, stretched back to the width it had *before* the gesture, and blanks the
+original. `RedrawnLine` + `restore_redrawn_line()` make it reversible and `TextMove`
+carries the records, so one undo restores text and layout.
+
+Three defects were found by isolation and fixed:
+
+1. **The copy drifted 8.05 pt right** — exactly the justified-vs-natural width
+   difference. The stretch composition shifts the origin, so horizontal placement is
+   now set absolutely (`matrix.e() += item.left - copy_left`) after stretching.
+   Verified: the copy's box is `435.66..741.95`, identical to the original's.
+2. **Copies were located by a predicted index**, which regeneration invalidates.
+   They are now found by text + nearest position.
+3. **Repairing stage by stage doubled every line.** Fixed by repairing
+   **once per gesture**: every index the gesture moved (dragged lines, gap-closing
+   lines, slot lines) is collected with its pre-gesture width, and a single
+   `repair_moved_text()` call runs at drop time. That matches the case verified in
+   isolation (1–3 lines in one call render cleanly).
+
+Result on the test bulletin: dragging a line in the justified right column now moves
+it **without** spreading it across the page — the paragraph's other lines stay
+typeset correctly.
+
+**Drop slots stay off** (`DROP_SLOTS_ENABLED = false`) although the logic is
+complete and unit-tested. Slot pushing moves *more* lines, and the end-to-end check
+still produced overlaps where the dropped line lands on an existing baseline (the
+slot excludes lines at the drop baseline itself). That needs its own pass.
+
+### 11.4.6 Mid-word splits: fixed
+
+Reported from a screenshot: dragging picked up `Ani` and left `ta Thompson`, or moved
+`The Lord's Pray` and left `er` behind. Cause: PDFium invents spaces at text-object
+boundaries, so a word can be modelled as two tokens (`Ani` + `ta`); a selection made
+at that boundary split mid-word.
+
+`plan_object_split()` now **grows the span to whole tokens** before splitting: the
+start extends left while the preceding character is not whitespace, and the end
+extends right until whitespace. A selection inside a token takes the whole token with
+it; a selection on whole words is unchanged. Verified on the bulletin: a partial
+selection of "Anita" now moves `"Anita"` in full, and on the fixture a two-character
+selection of "PDF" moves `"PDF"` (test `selection_mid_word_moves_the_whole_word`).
+
+### 11.4.7 Slot pushing: enabled
+
+Dropping text now opens a slot for it: the destination lines move down by the dropped
+block's height, so nothing lands on top of anything.
+
+Two refinements made it correct on a real document:
+
+- **A line sitting at the drop baseline is pushed too** — otherwise text dropped
+  exactly onto a line lands on it.
+- **A merged line moves only its stationary runs.** When a dropped line shares a
+  baseline with existing text, `visual_lines()` fuses them into one line; that line's
+  non-dropped runs are what move, never the dropped ones (which would double-shift).
+
+Verified on the bulletin: dropping a line onto `Our Father, who art in heaven…` pushed
+14 runs down 17.04 pt, the dropped line took the vacated baseline, the paragraph
+stayed justified and typeset, and nothing overlapped. Test:
+`dropping_onto_a_line_pushes_it_too`.
+
+`DROP_SLOTS_ENABLED` is now `true`.
+
+### 11.4.8 Fragments join their line by text object
+
+`UMH #514` and `"Stand Up, Stand Up for Jesus"` are two halves of **one text object**
+that PDFium's line detection reports as two blocks, so they travelled separately
+(selecting the song line left the code behind, and vice versa).
+
+`text_runs()` now merges runs that (a) share the same owning text object — resolved
+per run with `text_object_index_for_char` — and (b) sit on the same baseline. Verified
+on the bulletin: the line is now a single run of 8 words spanning `36.0..378.3`, so
+selecting, dragging or shifting it takes the whole line.
+
+Not covered by this: a right-aligned **name** such as `Jan Rinehart` lives in its own
+text object, so it stays a separate line. The next signal for it is alignment, not
+geometry: such a fragment's right edge matches the column's right edge to within a
+point (381.0 here), which is what distinguishes it from the neighbouring column.
+
+### 11.5 Known limitations (still open)
+
+- **Delete removes one word.** With a group selected, Delete/Backspace acts on the
+  anchor word only; multi-word delete needs a per-run undo record.
+- **Undo leaves the object split.** Undo/redo restore matrices, so the page looks
+  exactly as before, but the split objects remain. Visually lossless; the page
+  keeps one extra object per side.
+- **Text inside Form XObjects** (headers, footers, watermarks, some InDesign and
+  print exports) is not listed by `page.objects()`, so it cannot be selected or
+  dragged at all. Needs a separate content-stream walk.
+- **No re-wrapping at the destination.** Dropped text is redrawn where it lands as
+  its own object; it is not inserted into the paragraph under the pointer and
+  re-broken. The source side now closes up (§11.4.3), the destination side does not.
+- **Cross-page drops** are not supported: this is still a page-object mover.
+- **Justification / per-character kerning** inside a split line is inherited from
+  PDFium's parsed object text. The split places pieces at their true origins, so it
+  is lossless at split time, but any spacing PDFium already drops on
+  `regenerate_content()` stays dropped — pre-existing for every move or edit.
+
+### 11.6 Next: the text-block model (PDFGear parity)
+
+To move text *anywhere* — other column, other page, with the original spot wiped:
+
+1. Add `TextBlock { rect, baseline, font_ref, text, source_objects }` to
+   `text_model.rs`, grouped from runs.
+2. Drag changes block geometry only; commit on release.
+3. On commit, erase the source (real removal of the show-text operators, not just
+   a white rectangle, so copy-paste cannot leak the old text) and emit a new text
+   object at the drop point with the block's font.
+4. Handle the fonts that cannot be re-embedded, and cross-page moves.

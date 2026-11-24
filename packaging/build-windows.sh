@@ -29,6 +29,10 @@ if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     exit 1
 fi
 
+# Baked into the binary so the running app can say which build it is.
+export BUILD_STAMP="$(date '+%Y-%m-%d %H:%M')"
+echo "Build stamp: $BUILD_STAMP"
+
 # OCR (Tesseract) is not available on this Windows build; it links a native C
 # library that cannot be cross-compiled from macOS.
 RUSTC="$toolchain_dir/bin/rustc" cargo build --release \

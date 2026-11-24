@@ -6,6 +6,7 @@
 //! for a single line.
 
 use pdf_viewer::annotations::Annotation;
+use pdf_viewer::RedrawnLine;
 use pdfium_render::prelude::{PdfMatrix, PdfPageTextRenderMode};
 
 /// One move-image edit. Undo/redo restores the object's exact matrix.
@@ -17,13 +18,26 @@ pub struct ImageMove {
     pub after_matrix: PdfMatrix,
 }
 
-/// One move-text edit. Undo/redo restores the text object's exact matrix.
+/// One text object's matrix before and after a move.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TextMove {
-    pub page: usize,
+pub struct TextObjectMove {
     pub object_index: usize,
     pub before_matrix: PdfMatrix,
     pub after_matrix: PdfMatrix,
+}
+
+/// One move-text edit. Undo/redo restores every moved text object's exact matrix,
+/// and puts back any line that had to be re-authored because PDFium mangled it.
+///
+/// A drag usually moves one object, but it moves a *group* when the line was
+/// split across several text objects (or when a word was split out to be dragged
+/// on its own), so the step records each object separately.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextMove {
+    pub page: usize,
+    pub moves: Vec<TextObjectMove>,
+    /// Lines replaced by a fresh copy during the move (see `RedrawnLine`).
+    pub redrawn: Vec<RedrawnLine>,
 }
 
 /// One restyle-text edit (font size + render mode). Undo/redo restores both.
@@ -35,6 +49,15 @@ pub struct TextStyle {
     pub after_size: f32,
     pub before_mode: PdfPageTextRenderMode,
     pub after_mode: PdfPageTextRenderMode,
+}
+
+/// One text-colour edit on an original PDF text object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextColor {
+    pub page: usize,
+    pub object_index: usize,
+    pub before: [u8; 4],
+    pub after: [u8; 4],
 }
 
 /// One rotate-image edit.
@@ -83,6 +106,15 @@ pub struct TextEdit {
     pub object_index: usize,
 }
 
+/// One AcroForm field value edit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormFieldEdit {
+    pub page: usize,
+    pub index: usize,
+    pub before: String,
+    pub after: String,
+}
+
 /// One undoable document edit.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DocumentEdit {
@@ -94,9 +126,11 @@ pub enum DocumentEdit {
     ImageMove(ImageMove),
     TextMove(TextMove),
     TextStyle(TextStyle),
+    TextColor(TextColor),
     ImageRotate(ImageRotate),
     ImageReplace(ImageReplace),
     ImageCrop(ImageCrop),
+    FormField(FormFieldEdit),
 }
 
 /// One undoable step: a label plus the edit itself.

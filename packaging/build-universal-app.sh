@@ -26,6 +26,10 @@ fi
 cd "$project_dir"
 rustup target add x86_64-apple-darwin
 
+# Baked into the binary so the running app can say which build it is.
+export BUILD_STAMP="$(date '+%Y-%m-%d %H:%M')"
+echo "Build stamp: $BUILD_STAMP"
+
 # The native (arm64) build enables OCR; the x86_64 cross-build does not, since
 # Tesseract's C library cannot be cross-compiled from an arm64 host.
 RUSTC="$toolchain_dir/bin/rustc" cargo build --release --features ocr --bin pdf-editor

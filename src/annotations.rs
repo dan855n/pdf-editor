@@ -11,6 +11,12 @@ use pdfium_render::prelude::*;
 pub enum AnnotationKind {
     /// Text highlight (translucent fill over a rectangle).
     Highlight,
+    /// Strikeout line through selected text.
+    Strikeout,
+    /// Underline beneath selected text.
+    Underline,
+    /// Squiggly underline beneath selected text.
+    Squiggly,
     /// Freehand ink stroke (a polyline of points).
     Ink,
     /// Rectangle outline / fill.
@@ -21,26 +27,36 @@ pub enum AnnotationKind {
     FreeText,
     /// A raster image stamped onto the page (signature, logo, ...).
     Stamp,
+    /// A pending redaction region (permanently destroys underlying content when applied).
+    Redaction,
 }
 
 impl AnnotationKind {
-    pub const ALL: [AnnotationKind; 6] = [
+    pub const ALL: [AnnotationKind; 10] = [
         AnnotationKind::Highlight,
+        AnnotationKind::Strikeout,
+        AnnotationKind::Underline,
+        AnnotationKind::Squiggly,
         AnnotationKind::Ink,
         AnnotationKind::Rectangle,
         AnnotationKind::Ellipse,
         AnnotationKind::FreeText,
         AnnotationKind::Stamp,
+        AnnotationKind::Redaction,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             AnnotationKind::Highlight => "Highlight",
+            AnnotationKind::Strikeout => "Strikeout",
+            AnnotationKind::Underline => "Underline",
+            AnnotationKind::Squiggly => "Squiggly",
             AnnotationKind::Ink => "Ink",
             AnnotationKind::Rectangle => "Rectangle",
             AnnotationKind::Ellipse => "Ellipse",
             AnnotationKind::FreeText => "Text",
             AnnotationKind::Stamp => "Image",
+            AnnotationKind::Redaction => "Redact",
         }
     }
 
@@ -48,12 +64,27 @@ impl AnnotationKind {
     pub fn pdf_subtype(self) -> &'static str {
         match self {
             AnnotationKind::Highlight => "Highlight",
+            AnnotationKind::Strikeout => "Strikeout",
+            AnnotationKind::Underline => "Underline",
+            AnnotationKind::Squiggly => "Squiggly",
             AnnotationKind::Ink => "Ink",
             AnnotationKind::Rectangle => "Square",
             AnnotationKind::Ellipse => "Circle",
             AnnotationKind::FreeText => "FreeText",
             AnnotationKind::Stamp => "Stamp",
+            AnnotationKind::Redaction => "Square",
         }
+    }
+
+    /// Whether this kind marks a region of selected text (has per-line quads).
+    pub fn is_text_markup(self) -> bool {
+        matches!(
+            self,
+            AnnotationKind::Highlight
+                | AnnotationKind::Strikeout
+                | AnnotationKind::Underline
+                | AnnotationKind::Squiggly
+        )
     }
 }
 
@@ -100,6 +131,10 @@ pub struct Annotation {
     pub points: Vec<(f32, f32)>,
     /// Text content for free-text annotations.
     pub text: String,
+    /// Per-line quads for text-markup annotations, in PDF points, as
+    /// `(x1,y1, x2,y2, x3,y3, x4,y4)` in counter-clockwise order starting at
+    /// the bottom-left corner. Empty means "use [`Self::rect`]".
+    pub quads: Vec<(f32, f32, f32, f32, f32, f32, f32, f32)>,
     pub style: StrokeStyle,
     /// Font size for free-text annotations, in points.
     pub font_size: f32,
@@ -117,6 +152,7 @@ impl Annotation {
             rect: PdfRect::new_from_values(0.0, 0.0, 0.0, 0.0),
             points: Vec::new(),
             text: String::new(),
+            quads: Vec::new(),
             style: StrokeStyle::default(),
             font_size: 14.0,
             image_path: None,

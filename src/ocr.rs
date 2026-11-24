@@ -23,7 +23,9 @@ pub struct OcrWord {
 /// Render `page` at high resolution and OCR it, returning the recognized words
 /// in PDF page coordinates.
 ///
-/// `tessdata` is the directory containing Tesseract's `*.traineddata` files.
+/// On macOS/Linux (with `--features ocr`), this uses Tesseract via `leptess`,
+/// and `tessdata` is the directory containing `*.traineddata` files.
+#[cfg(feature = "ocr")]
 pub fn ocr_page_words(
     doc: &OpenDocument,
     page: usize,
@@ -62,11 +64,110 @@ pub fn ocr_page_words(
     parse_ocr_tsv(&tsv, page_w, page_h, width_px as f32, height_px as f32)
 }
 
+/// Render `page` at high resolution and OCR it using Windows 10/11's built-in
+/// `Windows.Media.Ocr` engine, returning recognized words in PDF coordinates.
+#[cfg(all(target_os = "windows", not(feature = "ocr")))]
+pub fn ocr_page_words(
+    doc: &OpenDocument,
+    page: usize,
+    _tessdata: &std::path::Path,
+    _lang: &str,
+) -> Result<Vec<OcrWord>, DocumentError> {
+    use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
+    use windows::Media::Ocr::OcrEngine;
+    use windows::Storage::Streams::DataWriter;
+    use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
+
+    const SCALE: f32 = 4.0;
+
+    let pdf_page = doc.doc.pages().get(page as i32)?;
+    let page_w = pdf_page.width().value.max(1.0);
+    let page_h = pdf_page.height().value.max(1.0);
+    let width_px = (page_w * SCALE).round().max(1.0) as i32;
+    let height_px = (page_h * SCALE).round().max(1.0) as i32;
+
+    let config = PdfRenderConfig::new()
+        .set_target_width(width_px)
+        .set_target_height(height_px);
+    let bitmap = pdf_page.render_with_config(&config)?;
+    let rgba = bitmap.as_image()?.to_rgba8();
+
+    unsafe {
+        let _ = RoInitialize(RO_INIT_MULTITHREADED);
+    }
+
+    let writer = DataWriter::new()
+        .map_err(|e| DocumentError(format!("could not create WinRT DataWriter: {e}")))?;
+    writer
+        .WriteBytes(rgba.as_raw())
+        .map_err(|e| DocumentError(format!("could not write image bytes: {e}")))?;
+    let buffer = writer
+        .DetachBuffer()
+        .map_err(|e| DocumentError(format!("could not detach WinRT buffer: {e}")))?;
+
+    let sw_bitmap = SoftwareBitmap::CreateCopyWithAlphaFromBuffer(
+        &buffer,
+        BitmapPixelFormat::Rgba8,
+        width_px,
+        height_px,
+        BitmapAlphaMode::Premultiplied,
+    )
+    .map_err(|e| DocumentError(format!("could not create SoftwareBitmap: {e}")))?;
+
+    let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(|e| {
+        DocumentError(format!(
+            "Windows OCR engine unavailable (check Windows language pack): {e}"
+        ))
+    })?;
+
+    let result = engine
+        .RecognizeAsync(&sw_bitmap)
+        .and_then(|op| op.join())
+        .map_err(|e| DocumentError(format!("Windows OCR failed: {e}")))?;
+
+    let sx = page_w / (width_px as f32).max(1.0);
+    let sy = page_h / (height_px as f32).max(1.0);
+    let mut words = Vec::new();
+
+    let lines = result
+        .Lines()
+        .map_err(|e| DocumentError(format!("could not read OCR lines: {e}")))?;
+    for line in lines {
+        let Ok(line_words) = line.Words() else {
+            continue;
+        };
+        for word in line_words {
+            let Ok(text_h) = word.Text() else { continue };
+            let text = text_h.to_string_lossy().trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            let Ok(rect) = word.BoundingRect() else {
+                continue;
+            };
+            let left = rect.X * sx;
+            let right = (rect.X + rect.Width) * sx;
+            let top = page_h - rect.Y * sy;
+            let bottom = page_h - (rect.Y + rect.Height) * sy;
+            words.push(OcrWord {
+                text,
+                left,
+                bottom,
+                right,
+                top,
+            });
+        }
+    }
+
+    Ok(words)
+}
+
 /// Parse Tesseract's TSV output into PDF-space words.
 ///
 /// Tesseract's TSV columns are: level, page, block, par, line, word, left,
 /// top, width, height, conf, text. Word rows have `level == 5`; the box is in
 /// image pixels with the origin top-left.
+#[cfg(any(feature = "ocr", test))]
 fn parse_ocr_tsv(
     tsv: &str,
     page_w: f32,

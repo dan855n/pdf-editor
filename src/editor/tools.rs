@@ -7,6 +7,8 @@ use pdf_viewer::annotations::{Annotation, AnnotationKind, StrokeStyle};
 pub enum Tool {
     /// Select, move and resize existing annotations.
     Select,
+    /// Drag over text to select it, then copy / highlight / strikeout / underline.
+    TextSelect,
     /// Drag a rectangle to highlight text.
     Highlight,
     /// Freehand drawing.
@@ -23,11 +25,16 @@ pub enum Tool {
     Image,
     /// Click an existing image in the PDF to select it.
     ImageSelect,
+    /// Drag a rectangle to mark a region for permanent redaction.
+    Redact,
+    /// Drag a rectangle to add a clickable hyperlink.
+    Link,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 9] = [
+    pub const ALL: [Tool; 12] = [
         Tool::Select,
+        Tool::TextSelect,
         Tool::Highlight,
         Tool::Ink,
         Tool::EditText,
@@ -36,11 +43,14 @@ impl Tool {
         Tool::Text,
         Tool::Image,
         Tool::ImageSelect,
+        Tool::Redact,
+        Tool::Link,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Tool::Select => "Select",
+            Tool::TextSelect => "Select text",
             Tool::Highlight => "Highlight",
             Tool::Ink => "Ink",
             Tool::EditText => "Edit text",
@@ -49,12 +59,15 @@ impl Tool {
             Tool::Text => "Text",
             Tool::Image => "Image",
             Tool::ImageSelect => "Img select",
+            Tool::Redact => "Redact",
+            Tool::Link => "Link",
         }
     }
 
     pub fn icon(self) -> &'static str {
         match self {
             Tool::Select => "⬚",
+            Tool::TextSelect => "🅐",
             Tool::Highlight => "🖍",
             Tool::Ink => "✏️",
             Tool::EditText => "🔤",
@@ -63,12 +76,15 @@ impl Tool {
             Tool::Text => "🅣",
             Tool::Image => "🖼",
             Tool::ImageSelect => "🖼️🔍",
+            Tool::Redact => "🛡",
+            Tool::Link => "🔗",
         }
     }
 
     pub fn to_kind(self) -> Option<AnnotationKind> {
         match self {
             Tool::Select => None,
+            Tool::TextSelect => None,
             Tool::Highlight => Some(AnnotationKind::Highlight),
             Tool::Ink => Some(AnnotationKind::Ink),
             Tool::EditText => None,
@@ -77,6 +93,8 @@ impl Tool {
             Tool::Text => Some(AnnotationKind::FreeText),
             Tool::Image => Some(AnnotationKind::Stamp),
             Tool::ImageSelect => None,
+            Tool::Redact => Some(AnnotationKind::Redaction),
+            Tool::Link => None,
         }
     }
 }
